@@ -1,12 +1,50 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from routes.tts import router as tts_route
 from fastapi.middleware.cors import CORSMiddleware
+from config import AUDIO_SWEEP_SECONDS, CORS_ORIGINS, LOG_LEVEL
+from services.cache import clear_all, sweep
+import asyncio
+import logging
 
-app = FastAPI()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(levelname)-8s %(name)s: %(message)s",
+)
+
+logger = logging.getLogger(__name__)
+
+
+async def _sweeper():
+    while True:
+        await asyncio.sleep(AUDIO_SWEEP_SECONDS)
+
+        try:
+            sweep()
+        except Exception:
+            # A failed sweep must not kill the loop, or nothing is ever
+            # cleaned again for the life of the process.
+            logger.exception("Audio sweep failed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Anything still on disk belongs to a process that is gone.
+    clear_all()
+    task = asyncio.create_task(_sweeper())
+
+    try:
+        yield
+    finally:
+        task.cancel()
+        clear_all()
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173","https://suno-story.vercel.app"],  
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
