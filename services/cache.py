@@ -38,6 +38,19 @@ def publish(scratch: Path, session_id: str) -> None:
     scratch.replace(cached_file(session_id))
 
 
+def touch(path: Path) -> None:
+    """Mark a file as still in use.
+
+    The sweeper works off modification time, and an hour-long reading easily
+    outlives the cache window it started in. Without this the file could be
+    deleted from under a listener who is still partway through it.
+    """
+    try:
+        path.touch()
+    except OSError:
+        logger.warning("Could not refresh cached audio %s", path)
+
+
 def discard(session_id: str) -> None:
     for path in CACHE_DIR.glob(f"{session_id}*"):
         _remove(path)

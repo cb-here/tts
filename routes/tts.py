@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 from schemas.schemas import TTSRequest, TTSStreamRequest, TTSStreamSession
 from services.tts import render_to_file, stream_tts
-from services.cache import cached_file, publish, reserve
+from services.cache import cached_file, publish, reserve, touch
 from services.sessions import create_session, get_session
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
@@ -75,6 +75,7 @@ async def stream(
     if finished.exists():
         # Already rendered once, so it can be served as an ordinary file —
         # with a length, and with byte ranges for seeking.
+        touch(finished)
         return FileResponse(finished, media_type="audio/mpeg", headers=headers)
 
     scratch = reserve(session_id)
