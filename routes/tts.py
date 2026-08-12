@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 from schemas.schemas import TTSRequest, TTSStreamRequest, TTSStreamSession
-from services.tts import render_to_file, stream_tts
+from services.tts import estimate_duration, render_to_file, stream_tts
 from services.cache import cached_file, publish, reserve, touch
 from services.sessions import create_session, get_session
 from fastapi.responses import FileResponse, StreamingResponse
@@ -48,6 +48,7 @@ async def create_stream(payload: TTSStreamRequest):
     return TTSStreamSession(
         session_id=session_id,
         stream_url=f"{router.prefix}/stream/{session_id}",
+        estimated_seconds=estimate_duration(payload.text, payload.rate),
     )
 
 

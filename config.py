@@ -23,6 +23,7 @@ NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
 # Casting is one blocking LLM call before the first audio byte, so keep it short.
 CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "45"))
 CASTING_MAX_CHARS = int(os.getenv("CASTING_MAX_CHARS", "20000"))
+TRANSLITERATE_MAX_CHARS = int(os.getenv("TRANSLITERATE_MAX_CHARS", "30000"))
 
 
 # Finished audio is kept only long enough for the listener to press Download;

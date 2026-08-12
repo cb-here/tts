@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from routes.text import router as text_route
 from routes.tts import router as tts_route
 from fastapi.middleware.cors import CORSMiddleware
 from config import AUDIO_SWEEP_SECONDS, CORS_ORIGINS, LOG_LEVEL
@@ -62,3 +63,4 @@ async def status():
     }
 
 app.include_router(tts_route)
+app.include_router(text_route)

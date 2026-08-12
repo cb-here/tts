@@ -26,6 +26,27 @@ class TTSState(TypedDict):
     multi_voice: bool
 
 
+# Measured against edge-tts Hindi output at +0%: 5407 chars produced 497s and
+# 13480 chars produced 1168s, both about 0.088s per character.
+SECONDS_PER_CHAR = 0.088
+
+
+def estimate_duration(text: str, rate: str) -> float:
+    """Roughly how long this will take to read aloud.
+
+    A streamed response has no length, so the browser reports an infinite
+    duration and its progress bar has nothing to scale against. This gives the
+    player something honest to draw until the real duration is known.
+    """
+    try:
+        percent = int(rate.strip().rstrip("%"))
+    except (AttributeError, ValueError):
+        percent = 0
+
+    # "+50%" means half again as fast, so the reading is correspondingly shorter.
+    return len(text) * SECONDS_PER_CHAR / (1 + percent / 100)
+
+
 def build_lyrics_tag(text: str) -> bytes:
     """Render the ID3 lyrics tag on its own, without touching a file.
 

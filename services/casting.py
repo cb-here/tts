@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -67,9 +68,12 @@ VOICE_POOLS = {
 
 NARRATOR = "narrator"
 
-# Small enough that the first batch is labelled quickly, large enough that the
-# model can still see a whole exchange and tell who is answering whom.
-CAST_BATCH_SIZE = 8
+# Each batch costs one round trip regardless of its size, and the reply is only
+# a line per segment, so bigger batches are nearly free. Eight was small enough
+# that a long story needed dozens of calls and the casting fell behind the
+# reading; this covers several minutes of speech per call instead.
+CAST_BATCH_SIZE = 30
+CAST_PREFETCH = 3
 CAST_CONTEXT_SEGMENTS = 3
 
 # Merging exists to stop one-word replies each costing their own connection to
@@ -699,14 +703,33 @@ async def iter_cast(
         remainder[start : start + CAST_BATCH_SIZE]
         for start in range(0, len(remainder), CAST_BATCH_SIZE)
     ]
-    pending = asyncio.ensure_future(
-        label_segments(batches[0], context=_context_lines(lead, lead_utterances))
-    )
+
+    # Casting has to stay ahead of the reading, and a batch of quickfire dialogue
+    # can be spoken in seconds while its labels take half a minute to come back.
+    # Several batches are therefore kept in flight at once; waiting to see the
+    # previous one first would starve the stream on any dialogue-heavy story.
+    inflight: deque = deque()
+
+    def request(position: int) -> None:
+        inflight.append(
+            asyncio.ensure_future(
+                label_segments(
+                    batches[position],
+                    context=(
+                        _context_lines(lead, lead_utterances) if position == 0 else None
+                    ),
+                    known_characters=sorted(assigner.cast) or None,
+                )
+            )
+        )
 
     try:
+        for position in range(min(CAST_PREFETCH, len(batches))):
+            request(position)
+
         for position, batch in enumerate(batches):
             try:
-                labels = await pending
+                labels = await inflight.popleft()
             except Exception as error:
                 # An empty label set still reads correctly: narration keeps the
                 # narrator, and dialogue falls through to the stand-in voices.
@@ -721,24 +744,16 @@ async def iter_cast(
                 )
                 labels = {}
 
-            utterances = assigner.assign(batch, labels)
+            queued = position + len(inflight) + 1
+            if queued < len(batches):
+                request(queued)
 
-            if position + 1 < len(batches):
-                pending = asyncio.ensure_future(
-                    label_segments(
-                        batches[position + 1],
-                        context=_context_lines(batch, utterances),
-                        known_characters=sorted(assigner.cast),
-                    )
-                )
-            else:
-                pending = None
-
-            for utterance in utterances:
+            for utterance in assigner.assign(batch, labels):
                 yield utterance
     finally:
-        if pending is not None and not pending.done():
-            pending.cancel()
+        for task in inflight:
+            if not task.done():
+                task.cancel()
 
     named = sorted(set(assigner.cast) - set(UNNAMED_SPEAKERS))
 
