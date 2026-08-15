@@ -3,9 +3,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# NVIDIA NIM speaks the OpenAI chat-completions dialect, so a plain HTTP call is
-# all this needs — no extra SDK.
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
 
 CORS_ORIGINS = [
     origin.strip()

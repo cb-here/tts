@@ -60,6 +60,9 @@ SCRIPT_COLON = re.compile(r"^[ \t]*([^\s:][^:\n]{0,39}?)[ \t]*:[ \t]*(.*)$")
 SCRIPT_DASH = re.compile(r"^[ \t]*(\S[^\n]{0,39}?)[ \t]+[-–—][ \t]+(\S.*)$")
 # Pasted scripts often bullet their dialogue; the marker is not spoken.
 SCRIPT_BULLET = re.compile(r"^[ \t]*[-*•·—]+[ \t]+")
+# A whole line wrapped in emphasis, or a markdown heading — a sign or a title,
+# never a person speaking.
+MARKDOWN_LINE = re.compile(r"^(?:\*\*.*\*\*|__.*__|#{1,6}\s+.*)$")
 
 # Counting cues beats measuring what share of lines are cues: in the layout
 # where the name sits on its own line, only half the lines are ever cues.
@@ -70,11 +73,22 @@ MIN_SCRIPT_CUE_RATIO = 0.15
 
 def _script_cue(line: str) -> tuple[str, str] | None:
     """Read one line as a speaker cue, in either the colon or dash convention."""
+    # A line set entirely in bold is a sign or a heading, not someone speaking.
+    # Without this, "**देवगढ़ - 12 किलोमीटर**" reads as a character called
+    # "**देवगढ़" and the line is spoken in a voice of its own.
+    if MARKDOWN_LINE.match(line.strip()):
+        return None
+
     for pattern in (SCRIPT_COLON, SCRIPT_DASH):
         match = pattern.match(line)
 
         if match:
-            return match.group(1).strip(), match.group(2).strip()
+            speaker = match.group(1).strip()
+
+            if speaker.startswith(("*", "_", "#", ">")):
+                continue
+
+            return speaker, match.group(2).strip()
 
     return None
 
