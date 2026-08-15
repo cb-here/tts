@@ -3,7 +3,7 @@ from schemas.enums import VoiceEnum
 
 class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1)
-    voice: VoiceEnum = VoiceEnum.swara
+    voice: VoiceEnum = VoiceEnum.emma
     rate: str = "+0%"
 
 
