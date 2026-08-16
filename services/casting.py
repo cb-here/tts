@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import httpx
 
 from config import (
-    CASTING_MAX_CHARS,
+    CASTING_MAX_BATCHES,
     CASTING_TIMEOUT_SECONDS,
     MAX_CONCURRENT_CASTING,
     NVIDIA_API_KEY,
@@ -779,12 +779,15 @@ def _context_lines(segments: list[Segment], utterances: list[Utterance]) -> list
     return lines
 
 
-def _cannot_cast(text: str) -> str | None:
+def _cannot_cast(batches: int) -> str | None:
     if not casting_enabled():
         return "NVIDIA_API_KEY is not set"
 
-    if len(text) > CASTING_MAX_CHARS:
-        return f"text is {len(text)} chars, over the {CASTING_MAX_CHARS} limit"
+    if batches > CASTING_MAX_BATCHES:
+        return (
+            f"casting it would take {batches} model calls, over the "
+            f"{CASTING_MAX_BATCHES} allowed"
+        )
 
     return None
 
@@ -876,7 +879,26 @@ async def iter_cast(
             yield utterance
         return
 
-    reason = _cannot_cast(text)
+    # Everything ahead of the first quotation mark is narration by construction,
+    # so it needs no model at all. Handing it over immediately means the reading
+    # begins at once and the opening pages cover the casting call entirely — and
+    # a story with no dialogue never touches the API.
+    opening = next(
+        (index for index, segment in enumerate(segments) if segment.is_dialogue),
+        len(segments),
+    )
+    lead, remainder = segments[:opening], segments[opening:]
+
+    batches = [
+        remainder[start : start + CAST_BATCH_SIZE]
+        for start in range(0, len(remainder), CAST_BATCH_SIZE)
+    ]
+
+    # Judged on the work the text actually creates, not on how long it is. A
+    # novel of prose splits into a handful of batches; a short but relentless
+    # exchange of one-line dialogue splits into dozens, and it is the second one
+    # that floods the API and leaves the reading waiting.
+    reason = _cannot_cast(len(batches))
     if reason:
         logger.warning("Multi-voice unavailable (%s) — narrating in one voice", reason)
         for utterance in single_voice(text, voice, rate):
@@ -887,16 +909,6 @@ async def iter_cast(
     # actually needs a voice, so the opening narration covers its cost.
     cast_list = asyncio.ensure_future(identify_cast(text))
     assigner = VoiceAssigner(voice, rate, language=language_of(text))
-
-    # Everything ahead of the first quotation mark is narration by construction,
-    # so it needs no model at all. Handing it over immediately means the reading
-    # begins at once and the opening pages cover the casting call entirely — and
-    # a story with no dialogue never touches the API.
-    opening = next(
-        (index for index, segment in enumerate(segments) if segment.is_dialogue),
-        len(segments),
-    )
-    lead, remainder = segments[:opening], segments[opening:]
 
     lead_utterances: list[Utterance] = assigner.assign(lead, {}) if lead else []
 

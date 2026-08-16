@@ -21,10 +21,10 @@ NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
 
 # Casting is one blocking LLM call before the first audio byte, so keep it short.
 CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "45"))
-# Set low when casting was one call for the whole story. Now that labelling is
-# batched and runs ahead of the reading, a long story is no reason to give up on
-# multi-voice.
-CASTING_MAX_CHARS = int(os.getenv("CASTING_MAX_CHARS", "50000"))
+# Cost is driven by how many model calls the text creates, not by its length:
+# 50,000 characters of prose is 13 calls, while 20,000 of rapid dialogue is 53.
+# Capping the calls protects the free tier without punishing long prose.
+CASTING_MAX_BATCHES = int(os.getenv("CASTING_MAX_BATCHES", "40"))
 TRANSLITERATE_MAX_CHARS = int(os.getenv("TRANSLITERATE_MAX_CHARS", "30000"))
 
 
