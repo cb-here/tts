@@ -19,12 +19,46 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
 
+
+# NVIDIA's Magpie TTS, reached through the same key as the casting model. It
+# reads more naturally than edge-tts and about 13x faster than real time, but it
+# hands back a whole WAV rather than a stream, so the reading is cut into pieces
+# and the pieces are synthesised ahead of the playhead.
+MAGPIE_FUNCTION_ID = os.getenv(
+    "MAGPIE_FUNCTION_ID", "877104f7-e885-42b9-8de8-f6e4c6303969"
+)
+MAGPIE_URL = os.getenv(
+    "MAGPIE_URL",
+    f"https://{MAGPIE_FUNCTION_ID}.invocation.api.nvcf.nvidia.com/v1/audio/synthesize",
+)
+# 24000 is rejected outright and 44100 doubles the reply for no audible gain at
+# 64 kbps mono.
+MAGPIE_SAMPLE_RATE = int(os.getenv("MAGPIE_SAMPLE_RATE", "22050"))
+# Two ceilings meet here. The model refuses text over 2000 of its own units,
+# which Devanagari hits at about 1550 characters, and the gateway drops any
+# reply over 4 MB, which 22 kHz audio hits at about 1000. Staying well under
+# both also keeps the first piece quick, since nothing plays until it lands.
+MAGPIE_MAX_CHARS = int(os.getenv("MAGPIE_MAX_CHARS", "700"))
+# Nothing plays until the first piece lands, so the reading opens with a short
+# one — about a second and a half — and settles into full-length pieces after.
+MAGPIE_OPENING_CHARS = int(os.getenv("MAGPIE_OPENING_CHARS", "220"))
+# Pieces kept in flight ahead of the one being written out.
+MAGPIE_PREFETCH = int(os.getenv("MAGPIE_PREFETCH", "3"))
+MAGPIE_TIMEOUT_SECONDS = float(os.getenv("MAGPIE_TIMEOUT_SECONDS", "90"))
+# The free tier answers a short burst and then throttles, and at 13x real time
+# there is no need to push it — two in flight already outruns the listener.
+MAX_CONCURRENT_MAGPIE = int(os.getenv("MAX_CONCURRENT_MAGPIE", "2"))
+
 # Casting is one blocking LLM call before the first audio byte, so keep it short.
 CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "45"))
 # Cost is driven by how many model calls the text creates, not by its length:
 # 50,000 characters of prose is 13 calls, while 20,000 of rapid dialogue is 53.
 # Capping the calls protects the free tier without punishing long prose.
 CASTING_MAX_BATCHES = int(os.getenv("CASTING_MAX_BATCHES", "40"))
+# gpt-oss models think before answering. "medium" and "high" place lines with
+# their speakers more reliably, but the thinking happens on the one call the
+# first spoken word waits for, so the pause before audio roughly doubles a step.
+CASTING_REASONING_EFFORT = os.getenv("CASTING_REASONING_EFFORT", "low")
 TRANSLITERATE_MAX_CHARS = int(os.getenv("TRANSLITERATE_MAX_CHARS", "30000"))
 
 
@@ -42,4 +76,9 @@ MAX_CONCURRENT_CASTING = int(os.getenv("MAX_CONCURRENT_CASTING", "3"))
 
 
 def casting_enabled() -> bool:
+    return bool(NVIDIA_API_KEY)
+
+
+def magpie_enabled() -> bool:
+    # Same key as casting, so a deployment either has both or neither.
     return bool(NVIDIA_API_KEY)

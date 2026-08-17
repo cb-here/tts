@@ -22,6 +22,7 @@ import httpx
 
 from config import (
     CASTING_MAX_BATCHES,
+    CASTING_REASONING_EFFORT,
     CASTING_TIMEOUT_SECONDS,
     MAX_CONCURRENT_CASTING,
     NVIDIA_API_KEY,
@@ -29,6 +30,8 @@ from config import (
     NVIDIA_MODEL,
     casting_enabled,
 )
+from services.magpie import is_magpie
+from services.names import match_key
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +145,91 @@ VOICE_POOLS = {
     },
 }
 
+# The locale in a Magpie voice's name labels the speaker, not what they can
+# read: all 86 were confirmed to speak Hindi, and the language is sent
+# separately. That leaves thirteen distinct people — six women and seven men,
+# more than edge-tts can field — and the same pool serves either language.
+#
+_MAGPIE_FEMALE = [
+    "Magpie-Multilingual.EN-US.Mia",
+    "Magpie-Multilingual.EN-US.Aria",
+    "Magpie-Multilingual.EN-US.Sofia",
+    "Magpie-Multilingual.ES-US.Isabela",
+    "Magpie-Multilingual.HI-IN.Siwei",
+    "Magpie-Multilingual.FR-FR.Louise",
+]
+_MAGPIE_MALE = [
+    "Magpie-Multilingual.EN-US.Jason",
+    "Magpie-Multilingual.EN-US.Leo",
+    "Magpie-Multilingual.EN-US.Ray",
+    "Magpie-Multilingual.ES-US.Diego",
+    "Magpie-Multilingual.FR-FR.Pascal",
+    "Magpie-Multilingual.VI-VN.Long.Neutral",
+    "Magpie-Multilingual.ZH-CN.HouZhen",
+]
+
+MAGPIE_VOICE_POOLS = {
+    "hi": {"female": _MAGPIE_FEMALE, "male": _MAGPIE_MALE},
+    "en": {"female": _MAGPIE_FEMALE, "male": _MAGPIE_MALE},
+}
+
+def _speaker_stem(voice: str) -> str:
+    """The locale-and-name part of a voice, with any trailing variant dropped."""
+    parts = voice.split(".")
+
+    return ".".join(parts[1:3]) if len(parts) >= 3 else voice
+
+# Where a Magpie voice turns for help. Magpie is a hosted service on a free
+# tier, so a piece of a reading can fail while the rest succeeds; when that
+# happens the line is still spoken, by the closest edge-tts voice, rather than
+# leaving a hole in the story.
+EDGE_EQUIVALENT = {
+    "EN-US.Mia": "en-US-EmmaMultilingualNeural",
+    "EN-US.Aria": "fr-FR-VivienneMultilingualNeural",
+    "EN-US.Sofia": "pt-BR-ThalitaMultilingualNeural",
+    "ES-US.Isabela": "de-DE-SeraphinaMultilingualNeural",
+    "HI-IN.Siwei": "hi-IN-SwaraNeural",
+    "HI-IN.Sofia": "en-US-AriaNeural",
+    "FR-FR.Louise": "en-US-EmmaMultilingualNeural",
+    "ZH-CN.Siwei": "hi-IN-SwaraNeural",
+    "EN-US.Jason": "en-US-GuyNeural",
+    "EN-US.Leo": "ko-KR-HyunsuMultilingualNeural",
+    "EN-US.Ray": "it-IT-GiuseppeMultilingualNeural",
+    "ES-US.Diego": "fr-FR-RemyMultilingualNeural",
+    "FR-FR.Pascal": "ko-KR-HyunsuMultilingualNeural",
+    "VI-VN.Long": "it-IT-GiuseppeMultilingualNeural",
+    "ZH-CN.HouZhen": "fr-FR-RemyMultilingualNeural",
+    "HI-IN.Leo": "hi-IN-MadhurNeural",
+    "HI-IN.Pascal": "ko-KR-HyunsuMultilingualNeural",
+}
+
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+
+
+def edge_equivalent(voice: str) -> str:
+    """The edge-tts voice standing in for a Magpie one that would not answer.
+
+    Keyed on the speaker rather than the exact voice, so an emotional variant
+    falls back to the same stand-in the plain voice would have used.
+    """
+    if not is_magpie(voice):
+        return voice
+
+    return EDGE_EQUIVALENT.get(
+        _speaker_stem(voice), "en-US-EmmaMultilingualNeural"
+    )
+
+
+def pool_for(base_voice: str, language: str) -> dict[str, list[str]]:
+    """The voices a cast may draw on.
+
+    A reading stays on one engine throughout — the narrator's voice decides
+    which — because the two are encoded differently and splicing between them
+    mid-story would be audible.
+    """
+    pools = MAGPIE_VOICE_POOLS if is_magpie(base_voice) else VOICE_POOLS
+
+    return pools.get(language, pools["en"])
 
 
 def language_of(text: str) -> str:
@@ -183,9 +270,15 @@ Rules:
   Write narrator in lowercase English. Never translate that word.
 - For a DIALOGUE segment, work out who is speaking from the narration directly
   before and after it, which usually names them ("मोनू ने पूछा", "the old man
-  replied", "she said").
-- Two dialogue segments in a row are usually two different people answering
-  each other. Do not give every line to the same character.
+  replied", "she said"). A name in the narration touching a line beats any
+  guess from the words themselves.
+- A speech broken in half by its own attribution stays with one person. In
+  "[3] DIALOGUE तुमने ये क्यों किया?", "[4] रवि चिल्लाया।", "[5] DIALOGUE
+  मैंने तुम पर भरोसा किया था!", segments 3 and 5 are BOTH रवि — the narration
+  between them says who was talking, it does not hand over to someone else.
+  The same holds for "[n] बोली," and "[n] ने कहा," sitting mid-sentence.
+- Two dialogue segments with nothing between them are usually two different
+  people answering each other. Do not give every line to the same character.
 - Name each character exactly as the story spells it, spelled identically every
   time that character speaks.
 - "gender" must be "male", "female" or "neutral".
@@ -207,6 +300,14 @@ class Segment:
     # Set when the text names its own speaker, as a screenplay does. No model
     # is needed to work out who is talking in that case.
     speaker: str | None = None
+
+
+@dataclass(frozen=True)
+class Label:
+    """What the casting model decided about one segment."""
+
+    speaker: str
+    gender: str = "neutral"
 
 
 @dataclass(frozen=True)
@@ -358,10 +459,9 @@ async def _ask(system_prompt: str, user_content: str, subject: str) -> dict:
         ],
     }
 
-    if "gpt-oss" in NVIDIA_MODEL:
-        # These models think before answering; at the default effort the pause
-        # before the first spoken word roughly doubles.
-        body["reasoning_effort"] = "low"
+    if "gpt-oss" in NVIDIA_MODEL and CASTING_REASONING_EFFORT:
+        # Only these models take the setting; sending it to others is an error.
+        body["reasoning_effort"] = CASTING_REASONING_EFFORT
 
     async with _casting_slots:
         async with httpx.AsyncClient(timeout=CASTING_TIMEOUT_SECONDS) as client:
@@ -411,15 +511,23 @@ async def _ask(system_prompt: str, user_content: str, subject: str) -> dict:
 
 def _is_narrator(speaker: str) -> bool:
     lowered = speaker.strip().lower()
-    return lowered in NARRATOR_ALIASES or "narrat" in lowered
+
+    # "arrator" as well as "narrat", because the model sometimes answers in both
+    # scripts at once — "नarrator" begins with a Devanagari न and so matches
+    # neither the alias list nor a check anchored on the leading n.
+    return (
+        lowered in NARRATOR_ALIASES
+        or "narrat" in lowered
+        or "arrator" in lowered
+    )
 
 
 async def label_segments(
     segments: list[Segment],
     context: list[str] | None = None,
     known_characters: list[str] | None = None,
-) -> dict[int, tuple[str, str]]:
-    """Ask the model who speaks each segment. Returns {index: (speaker, gender)}."""
+) -> dict[int, Label]:
+    """Ask the model who speaks each segment, and how."""
     listing = "\n".join(
         f"[{index}]{' DIALOGUE' if segment.is_dialogue else ''} {segment.text[:400]}"
         for index, segment in enumerate(segments)
@@ -450,7 +558,7 @@ async def label_segments(
 
     parsed = await _ask(SYSTEM_PROMPT, listing, subject=f"{len(segments)} segments")
 
-    labels: dict[int, tuple[str, str]] = {}
+    labels: dict[int, Label] = {}
 
     for entry in parsed.get("labels", []):
         try:
@@ -464,7 +572,7 @@ async def label_segments(
         speaker = str(entry.get("speaker") or NARRATOR).strip() or NARRATOR
         gender = str(entry.get("gender") or "neutral").strip().lower()
 
-        labels[index] = (speaker, gender)
+        labels[index] = Label(speaker=speaker, gender=gender)
 
     if not labels:
         # Well-formed JSON carrying nothing: a soft refusal looks exactly like
@@ -542,7 +650,9 @@ async def identify_cast(text: str) -> dict[str, str]:
         gender = str(entry.get("gender") or "neutral").strip().lower()
 
         if name and not _is_narrator(name):
-            genders[name.casefold()] = gender
+            # Keyed by the story's own spelling, not a folded one: this list is
+            # what every later batch is told to name its characters by.
+            genders[name] = gender
 
     if genders:
         logger.info(
@@ -610,17 +720,54 @@ class VoiceAssigner:
         self.base_voice = base_voice
         self.base_rate = base_rate
         self.has_narration = has_narration
-        self.pool = VOICE_POOLS.get(language, VOICE_POOLS["en"])
+        self.pool = pool_for(base_voice, language)
         self.cast: dict[str, tuple[str, str, str]] = {}
         self.counts = {"male": 0, "female": 0}
         self.unnamed_turns = 0
+        self.guessed: set[str] = set()
         # Decided from the whole story, so it beats whatever a single batch
         # guessed from a fragment.
-        self.known_genders = known_genders or {}
-        self.guessed: set[str] = set()
+        self.known_genders: dict[str, str] = {}
+        # Both keyed by match_key, so a character is found however this
+        # particular batch chose to spell them.
+        self._gender_by_key: dict[str, str] = {}
+        self._canonical: dict[str, str] = {}
+
+        self.learn_cast(known_genders or {})
+
+    def learn_cast(self, genders: dict[str, str]) -> None:
+        """Take the cast read from the whole story as the authority on names."""
+        self.known_genders = genders
+
+        for name, gender in genders.items():
+            key = match_key(name)
+
+            if key:
+                self._gender_by_key[key] = gender
+                self._canonical.setdefault(key, name)
+
+    def canonical(self, speaker: str) -> str:
+        """The one spelling of this character used for the rest of the story.
+
+        Without it "रवि" in the first batch and "Ravi" in the second are two
+        people: two voices for one character, and a gender that is looked up
+        under a name nothing was filed under.
+        """
+        key = match_key(speaker)
+
+        if not key:
+            return speaker
+
+        # Whoever names a character first sets the spelling — the up-front cast
+        # list if it found them, otherwise the batch that met them first.
+        return self._canonical.setdefault(key, speaker)
+
+    def gender_of(self, speaker: str) -> str | None:
+        """What the up-front cast list said about this character, if anything."""
+        return self._gender_by_key.get(match_key(speaker))
 
     def _gender_for(self, speaker: str, labelled: str) -> str:
-        settled = self.known_genders.get(speaker.casefold())
+        settled = self.gender_of(speaker)
 
         if settled in self.pool:
             return settled
@@ -675,12 +822,13 @@ class VoiceAssigner:
     def assign(
         self,
         segments: list[Segment],
-        labels: dict[int, tuple[str, str]],
+        labels: dict[int, Label],
     ) -> list[Utterance]:
         utterances: list[Utterance] = []
 
         for index, segment in enumerate(segments):
-            speaker, gender = labels.get(index, (NARRATOR, "neutral"))
+            label = labels.get(index) or Label(NARRATOR)
+            speaker, gender = label.speaker, label.gender
 
             narrates = not segment.is_dialogue or (
                 # A script cue of "narrator:" means exactly what it says.
@@ -701,6 +849,10 @@ class VoiceAssigner:
                     gender = "neutral"
                     self.unnamed_turns += 1
 
+                # Before the voice is chosen, so the same person is never asked
+                # for twice under two spellings.
+                speaker = self.canonical(speaker)
+
                 voice, rate, pitch = self._voice_for(speaker, gender)
 
             utterances.append(
@@ -718,7 +870,7 @@ class VoiceAssigner:
 
 def assign_voices(
     segments: list[Segment],
-    labels: dict[int, tuple[str, str]],
+    labels: dict[int, Label],
     base_voice: str,
     base_rate: str,
 ) -> list[Utterance]:
@@ -829,7 +981,7 @@ async def _cast_script(
         language=language_of(" ".join(s.text for s in segments[:20])),
     )
     labels = {
-        index: (segment.speaker, "neutral")
+        index: Label(segment.speaker)
         for index, segment in enumerate(segments)
         if segment.speaker
     }
@@ -841,7 +993,7 @@ async def _cast_script(
         len(assigner.cast),
         len(segments),
         ", ".join(
-            f"{name}={genders.get(name.casefold(), 'balanced')}" for name in names
+            f"{name}={assigner.gender_of(name) or 'balanced'}" for name in names
         ),
     )
 
@@ -921,7 +1073,7 @@ async def iter_cast(
         return
 
     try:
-        assigner.known_genders = await cast_list
+        assigner.learn_cast(await cast_list)
     except Exception as error:
         logger.warning(
             "Could not read the cast up front (%s: %s) — genders fall back to "
@@ -949,7 +1101,15 @@ async def iter_cast(
                     context=(
                         _context_lines(lead, lead_utterances) if position == 0 else None
                     ),
-                    known_characters=sorted(assigner.cast) or None,
+                    # The cast read from the whole story goes in from the first
+                    # batch onwards. Sending only the characters already cast
+                    # left that first batch with no names at all, free to
+                    # invent a spelling the rest of the story then disagreed
+                    # with.
+                    known_characters=sorted(
+                        set(assigner.cast) | set(assigner.known_genders)
+                    )
+                    or None,
                 )
             )
         )

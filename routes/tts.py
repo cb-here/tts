@@ -48,7 +48,9 @@ async def create_stream(payload: TTSStreamRequest):
     return TTSStreamSession(
         session_id=session_id,
         stream_url=f"{router.prefix}/stream/{session_id}",
-        estimated_seconds=estimate_duration(payload.text, payload.rate),
+        estimated_seconds=estimate_duration(
+            payload.text, payload.rate, payload.voice
+        ),
     )
 
 

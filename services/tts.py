@@ -1,15 +1,32 @@
 import asyncio
+import logging
+from collections import deque
 from collections.abc import AsyncIterator
-from config import MAX_CONCURRENT_TTS
+from config import (
+    MAGPIE_OPENING_CHARS,
+    MAGPIE_PREFETCH,
+    MAX_CONCURRENT_TTS,
+    magpie_enabled,
+)
 from io import BytesIO
 from langgraph.config import get_stream_writer
 from langgraph.graph import START, StateGraph, END
 from typing import TypedDict
 from edge_tts import Communicate
 from mutagen.id3 import ID3, USLT
-from services.casting import iter_cast, merge_stream
+from services.casting import (
+    Utterance,
+    edge_equivalent,
+    iter_cast,
+    language_of,
+    merge_stream,
+)
+from services.magpie import is_magpie, split_text, synthesize
+from services import magpie
 from uuid import uuid4
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 AUDIO_DIR = Path("audio")
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -30,21 +47,42 @@ class TTSState(TypedDict):
 # 13480 chars produced 1168s, both about 0.088s per character.
 SECONDS_PER_CHAR = 0.088
 
+# Magpie takes no pitch argument, so a character's pitch offset is applied by
+# resampling instead. This converts one to the other: +22Hz reads about 4%
+# faster and higher, which is roughly what edge-tts does with the same number.
+HZ_PER_TONE = 500.0
 
-def estimate_duration(text: str, rate: str) -> float:
+
+def _percent(rate: str) -> float:
+    try:
+        return int(rate.strip().rstrip("%")) / 100
+    except (AttributeError, ValueError):
+        return 0.0
+
+
+def _tone_of(utterance: Utterance) -> float:
+    """Fold an utterance's rate and pitch into one resampling factor."""
+    try:
+        hertz = int(utterance.pitch.strip().rstrip("Hz"))
+    except (AttributeError, ValueError):
+        hertz = 0
+
+    return (1 + _percent(utterance.rate)) * (1 + hertz / HZ_PER_TONE)
+
+
+def estimate_duration(text: str, rate: str, voice: str = "") -> float:
     """Roughly how long this will take to read aloud.
 
     A streamed response has no length, so the browser reports an infinite
     duration and its progress bar has nothing to scale against. This gives the
     player something honest to draw until the real duration is known.
     """
-    try:
-        percent = int(rate.strip().rstrip("%"))
-    except (AttributeError, ValueError):
-        percent = 0
+    seconds_per_char = (
+        magpie.SECONDS_PER_CHAR if is_magpie(voice) else SECONDS_PER_CHAR
+    )
 
     # "+50%" means half again as fast, so the reading is correspondingly shorter.
-    return len(text) * SECONDS_PER_CHAR / (1 + percent / 100)
+    return len(text) * seconds_per_char / (1 + _percent(rate))
 
 
 def build_lyrics_tag(text: str) -> bytes:
@@ -79,29 +117,36 @@ def embed_text(state: TTSState):
     }
 
 
-async def generate_audio(state: TTSState):
-    writer = get_stream_writer()
+async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
+    """Speak one piece with edge-tts and hand back the whole thing at once."""
+    audio = bytearray()
 
-    cast = merge_stream(
-        iter_cast(
-            text=state["text"],
-            voice=state["voice"],
-            rate=state["rate"],
-            multi_voice=state.get("multi_voice", False),
-        )
+    communicate = Communicate(
+        text=text,
+        voice=voice,
+        rate=utterance.rate,
+        pitch=utterance.pitch,
     )
 
+    async with _tts_slots:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio += chunk["data"]
+
+    return bytes(audio)
+
+
+async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
+    """Stream each utterance as edge-tts produces it."""
     spoken = 0
 
-    # Each utterance is its own mp3, and mp3 frames concatenate cleanly, so the
-    # speakers stitch into one continuous track.
     async for utterance in cast:
         communicate = Communicate(
             text=utterance.text,
             voice=utterance.voice,
             rate=utterance.rate,
             pitch=utterance.pitch,
-            )
+        )
 
         async with _tts_slots:
             async for chunk in communicate.stream():
@@ -109,6 +154,131 @@ async def generate_audio(state: TTSState):
                     writer(chunk["data"])
 
         spoken += 1
+
+    return spoken
+
+
+# Magpie needs to be told what it is reading, and the voice cannot say — every
+# speaker reads every language, whatever locale its name carries.
+MAGPIE_LOCALES = {"hi": "hi-IN", "en": "en-US"}
+
+
+async def _speak_magpie(
+    cast: AsyncIterator[Utterance], writer, language: str
+) -> int:
+    """Synthesise ahead of the playhead, then write the pieces out in order.
+
+    Magpie returns a finished WAV rather than a stream, so a piece being spoken
+    would otherwise be the only work in flight and the listener would hear the
+    gap before every one. Several are requested at once instead, while the
+    output stays strictly in reading order.
+    """
+    pending: deque[tuple[asyncio.Task, str, Utterance]] = deque()
+    spoken = 0
+    opening = True
+
+    async def write_next() -> None:
+        task, piece, utterance = pending.popleft()
+
+        try:
+            writer(await task)
+        except Exception as error:
+            # One piece failing must not cost the rest of the story, so it is
+            # read by the nearest edge-tts voice instead. The change is audible,
+            # which is better than a hole where the sentence should be.
+            stand_in = edge_equivalent(utterance.voice)
+            logger.warning(
+                "Magpie could not speak %d chars as %s (%s: %s) — falling back "
+                "to %s",
+                len(piece),
+                utterance.voice,
+                type(error).__name__,
+                error,
+                stand_in,
+            )
+            writer(await _edge_bytes(piece, utterance, stand_in))
+
+    try:
+        async for utterance in cast:
+            tone = _tone_of(utterance)
+
+            if opening:
+                pieces = split_text(utterance.text, MAGPIE_OPENING_CHARS)
+
+                if len(pieces) > 1:
+                    # Only the opening is shortened. Splitting the whole reading
+                    # this finely would multiply the round trips for nothing.
+                    pieces = pieces[:1] + split_text(" ".join(pieces[1:]))
+
+                opening = False
+            else:
+                pieces = split_text(utterance.text)
+
+            for piece in pieces:
+                pending.append(
+                    (
+                        asyncio.ensure_future(
+                            synthesize(piece, utterance.voice, tone, language)
+                        ),
+                        piece,
+                        utterance,
+                    )
+                )
+
+                # Awaiting the head is the backpressure: no more than
+                # MAGPIE_PREFETCH pieces are ever being synthesised at once.
+                while len(pending) > MAGPIE_PREFETCH:
+                    await write_next()
+
+            spoken += 1
+
+        while pending:
+            await write_next()
+    finally:
+        # Reached when the listener navigates away mid-story, which would
+        # otherwise leave paid-for requests running with nowhere to go.
+        for task, _, _ in pending:
+            if not task.done():
+                task.cancel()
+
+    return spoken
+
+
+async def generate_audio(state: TTSState):
+    writer = get_stream_writer()
+
+    voice = state["voice"]
+
+    if is_magpie(voice) and not magpie_enabled():
+        # Deciding this once is the difference between a reading that starts
+        # normally and one where every single piece is requested, refused, and
+        # then re-spoken by the stand-in.
+        stand_in = edge_equivalent(voice)
+        logger.warning(
+            "NVIDIA_API_KEY is not set, so %s is unavailable — reading in %s",
+            voice,
+            stand_in,
+        )
+        voice = stand_in
+
+    cast = merge_stream(
+        iter_cast(
+            text=state["text"],
+            voice=voice,
+            rate=state["rate"],
+            multi_voice=state.get("multi_voice", False),
+        )
+    )
+
+    # Each piece is its own mp3, and mp3 frames concatenate cleanly, so the
+    # speakers stitch into one continuous track. The narrator's voice decides
+    # the engine for the whole reading; the cast is drawn from the matching
+    # pool, so the two are never spliced together.
+    if is_magpie(voice):
+        language = MAGPIE_LOCALES.get(language_of(state["text"]), "en-US")
+        spoken = await _speak_magpie(cast, writer, language)
+    else:
+        spoken = await _speak_edge(cast, writer)
 
     return {
         "status": f"Done ({spoken} utterance{'' if spoken == 1 else 's'})"
