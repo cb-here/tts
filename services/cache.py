@@ -35,7 +35,21 @@ def reserve(session_id: str) -> Path:
 
 
 def publish(scratch: Path, session_id: str) -> None:
-    scratch.replace(cached_file(session_id))
+    """Adopt a finished render as the cached copy.
+
+    Failing here costs a re-render later and nothing else: by the time this runs
+    the listener already has every byte. It must not be allowed to tear down a
+    response that has, from their side, completely succeeded.
+    """
+    try:
+        scratch.replace(cached_file(session_id))
+    except OSError as error:
+        logger.warning(
+            "Could not cache the finished audio for %s (%s) — it will be "
+            "rendered again if asked for",
+            session_id,
+            error,
+        )
 
 
 def touch(path: Path) -> None:

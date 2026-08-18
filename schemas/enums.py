@@ -1,6 +1,10 @@
-from enum import Enum
+from enum import StrEnum
 
-class VoiceEnum(str, Enum):
+
+# StrEnum rather than (str, Enum): the two behave identically everywhere that
+# matters, but str() on the older form gives "VoiceEnum.magpie_mia" instead of
+# the voice itself, which is what every log line about a voice then reported.
+class VoiceEnum(StrEnum):
     # Microsoft ships only these two for hi-IN.
     swara = "hi-IN-SwaraNeural"
     madhur = "hi-IN-MadhurNeural"

@@ -56,6 +56,10 @@ MAX_BACKOFF_SECONDS = 12.0
 # much gets through also varies with who else is using it.
 MIN_INTERVAL_SECONDS = 1.0
 
+# Failures in a row before the service is left alone entirely, and for how long.
+BREAKER_LIMIT = 4
+BREAKER_COOLDOWN_SECONDS = 600.0
+
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 RETRYABLE_MESSAGE = "mapping failed"
 
@@ -114,7 +118,47 @@ class Pacer:
         self._next = max(self._next, loop.time() + seconds)
 
 
+class Breaker:
+    """Stops calling a service that has stopped answering.
+
+    A burst limit clears in seconds and is worth waiting out. A spent quota does
+    not, and every piece then pays the full retry budget — five attempts and
+    half a minute of backoff — only to fall back to edge-tts anyway. Once enough
+    pieces have failed in a row, this makes the rest fail instantly instead, so
+    the reading starts on the other engine rather than crawling.
+    """
+
+    def __init__(self, limit: int, cooldown: float):
+        self._limit = limit
+        self._cooldown = cooldown
+        self._misses = 0
+        self._open_until = 0.0
+
+    def is_open(self) -> bool:
+        return asyncio.get_running_loop().time() < self._open_until
+
+    def succeeded(self) -> None:
+        self._misses = 0
+        self._open_until = 0.0
+
+    def failed(self) -> None:
+        self._misses += 1
+
+        if self._misses >= self._limit:
+            self._open_until = (
+                asyncio.get_running_loop().time() + self._cooldown
+            )
+            logger.warning(
+                "Magpie has refused %d requests in a row — leaving it alone for "
+                "%.0f minutes and reading in edge-tts",
+                self._misses,
+                self._cooldown / 60,
+            )
+            self._misses = 0
+
+
 _pacer = Pacer(MIN_INTERVAL_SECONDS)
+_breaker = Breaker(BREAKER_LIMIT, BREAKER_COOLDOWN_SECONDS)
 
 
 def is_magpie(voice: str) -> bool:
@@ -235,6 +279,9 @@ async def synthesize(
     last: Exception | None = None
     language = language or locale_of(voice)
 
+    if _breaker.is_open():
+        raise RuntimeError("Magpie is not answering; not asking again yet")
+
     async with _magpie_slots:
         async with httpx.AsyncClient(timeout=MAGPIE_TIMEOUT_SECONDS) as client:
             for attempt in range(RETRIES + 1):
@@ -243,6 +290,8 @@ async def synthesize(
                 try:
                     wav = await _request(client, text, voice, language)
                     pcm, rate = read_wav(wav)
+
+                    _breaker.succeeded()
 
                     return encode_mp3(stretch(pcm, speed), rate, tone)
                 except MagpieError as error:
@@ -272,6 +321,8 @@ async def synthesize(
                     last,
                     cooldown,
                 )
+
+    _breaker.failed()
 
     raise RuntimeError(
         f"Magpie could not speak {len(text)} characters as {voice}"

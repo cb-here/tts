@@ -45,6 +45,10 @@ MAGPIE_OPENING_CHARS = int(os.getenv("MAGPIE_OPENING_CHARS", "220"))
 # Pieces kept in flight ahead of the one being written out.
 MAGPIE_PREFETCH = int(os.getenv("MAGPIE_PREFETCH", "3"))
 MAGPIE_TIMEOUT_SECONDS = float(os.getenv("MAGPIE_TIMEOUT_SECONDS", "90"))
+# Consecutive refusals before a reading stops asking Magpie at all. The free
+# tier tends to refuse in stretches rather than one-offs, and each refused piece
+# costs its whole retry budget before falling back regardless.
+MAGPIE_GIVE_UP_AFTER = int(os.getenv("MAGPIE_GIVE_UP_AFTER", "3"))
 # The free tier answers a short burst and then throttles, and at 13x real time
 # there is no need to push it — two in flight already outruns the listener.
 MAX_CONCURRENT_MAGPIE = int(os.getenv("MAX_CONCURRENT_MAGPIE", "2"))

@@ -180,6 +180,15 @@ def _speaker_stem(voice: str) -> str:
 
     return ".".join(parts[1:3]) if len(parts) >= 3 else voice
 
+# edge-tts voices that only speak their own language. Handed Devanagari they do
+# not approximate it — they return no audio at all and the line is simply lost,
+# so they must never be reached for as a stand-in or left narrating Hindi. Every
+# other voice here was confirmed to read Hindi and English alike.
+MONOLINGUAL_EDGE = {
+    "en-US-AriaNeural": "en-US-EmmaMultilingualNeural",
+    "en-US-GuyNeural": "ko-KR-HyunsuMultilingualNeural",
+}
+
 # Where a Magpie voice turns for help. Magpie is a hosted service on a free
 # tier, so a piece of a reading can fail while the rest succeeds; when that
 # happens the line is still spoken, by the closest edge-tts voice, rather than
@@ -190,10 +199,10 @@ EDGE_EQUIVALENT = {
     "EN-US.Sofia": "pt-BR-ThalitaMultilingualNeural",
     "ES-US.Isabela": "de-DE-SeraphinaMultilingualNeural",
     "HI-IN.Siwei": "hi-IN-SwaraNeural",
-    "HI-IN.Sofia": "en-US-AriaNeural",
+    "HI-IN.Sofia": "pt-BR-ThalitaMultilingualNeural",
     "FR-FR.Louise": "en-US-EmmaMultilingualNeural",
     "ZH-CN.Siwei": "hi-IN-SwaraNeural",
-    "EN-US.Jason": "en-US-GuyNeural",
+    "EN-US.Jason": "ko-KR-HyunsuMultilingualNeural",
     "EN-US.Leo": "ko-KR-HyunsuMultilingualNeural",
     "EN-US.Ray": "it-IT-GiuseppeMultilingualNeural",
     "ES-US.Diego": "fr-FR-RemyMultilingualNeural",
@@ -205,6 +214,20 @@ EDGE_EQUIVALENT = {
 }
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+
+
+def speakable(voice: str, language: str) -> str:
+    """The voice to actually use, given what language the story is in.
+
+    A listener can pick an English-only voice and paste a Hindi story, and
+    edge-tts answers that with silence rather than an error. Swapping it here
+    turns a reading that produces nothing into one that simply uses a
+    neighbouring voice.
+    """
+    if language == "hi" and voice in MONOLINGUAL_EDGE:
+        return MONOLINGUAL_EDGE[voice]
+
+    return voice
 
 
 def edge_equivalent(voice: str) -> str:
@@ -493,6 +516,15 @@ async def _ask(system_prompt: str, user_content: str, subject: str) -> dict:
             "Casting stopped early (finish_reason=%s) for %s",
             finish_reason,
             subject,
+        )
+
+    if not content:
+        # gpt-oss spends the token budget on reasoning before it writes
+        # anything, so a raised effort or a long story can use the lot and leave
+        # the content empty. Saying that beats a TypeError from json.loads.
+        raise ValueError(
+            f"casting reply had no content for {subject} "
+            f"(finish_reason={finish_reason}, model={NVIDIA_MODEL})"
         )
 
     try:

@@ -3,6 +3,7 @@ import logging
 from collections import deque
 from collections.abc import AsyncIterator
 from config import (
+    MAGPIE_GIVE_UP_AFTER,
     MAGPIE_OPENING_CHARS,
     MAGPIE_PREFETCH,
     MAGPIE_SAMPLE_RATE,
@@ -25,6 +26,7 @@ from services.casting import (
     iter_cast,
     language_of,
     merge_stream,
+    speakable,
 )
 from services.audio import silence
 from services.magpie import is_magpie, split_text, synthesize
@@ -158,23 +160,50 @@ def embed_text(state: TTSState):
     }
 
 
+# edge-tts occasionally closes a connection having sent nothing, on text it
+# reads perfectly well a second later — the same short lines were confirmed to
+# succeed three times out of three on their own. Since this path is already the
+# fallback, one more attempt is the difference between a lost line and a
+# recovered one.
+EDGE_RETRIES = 1
+EDGE_RETRY_SECONDS = 0.5
+
+
 async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
     """Speak one piece with edge-tts and hand back the whole thing at once."""
-    audio = bytearray()
+    for attempt in range(EDGE_RETRIES + 1):
+        audio = bytearray()
 
-    communicate = Communicate(
-        text=text,
-        voice=voice,
-        rate=utterance.rate,
-        pitch=utterance.pitch,
-    )
+        communicate = Communicate(
+            text=text,
+            voice=voice,
+            rate=utterance.rate,
+            pitch=utterance.pitch,
+        )
 
-    async with _tts_slots:
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio += chunk["data"]
+        try:
+            async with _tts_slots:
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio += chunk["data"]
+        except Exception:
+            if attempt == EDGE_RETRIES:
+                raise
 
-    return bytes(audio)
+            await asyncio.sleep(EDGE_RETRY_SECONDS)
+            continue
+
+        if audio:
+            return bytes(audio)
+
+        # A clean connection that carried no audio is the same failure wearing
+        # a different hat, and would otherwise be published as a silent line.
+        if attempt == EDGE_RETRIES:
+            raise RuntimeError(f"edge-tts returned no audio for {len(text)} characters")
+
+        await asyncio.sleep(EDGE_RETRY_SECONDS)
+
+    raise RuntimeError(f"edge-tts returned no audio for {len(text)} characters")
 
 
 async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
@@ -225,13 +254,35 @@ async def _speak_magpie(
     gap before every one. Several are requested at once instead, while the
     output stays strictly in reading order.
     """
-    pending: deque[tuple[asyncio.Task, str, Utterance]] = deque()
+    pending: deque[tuple[asyncio.Task | None, str, Utterance]] = deque()
     spoken = 0
     opening = True
     previous: tuple[str, str] | None = None
+    # Once the free tier starts refusing it usually keeps refusing, and every
+    # piece then spends its whole retry budget before falling back anyway. After
+    # a few in a row the reading gives up on Magpie and simply reads in edge-tts
+    # — far quicker than grinding through the backoff for every line left.
+    misses = 0
+    dropped = False
+
+    async def speak_on_edge(piece: str, utterance: Utterance) -> None:
+        stand_in = edge_equivalent(utterance.voice)
+
+        try:
+            writer(await _edge_bytes(piece, utterance, stand_in))
+        except Exception as error:
+            # Both engines are out. Holding the beat keeps the reading moving
+            # instead of tearing the connection down over one lost sentence.
+            logger.warning(
+                "Neither engine could speak %d chars (%s: %s) — skipping it",
+                len(piece),
+                type(error).__name__,
+                error,
+            )
+            writer(silence(PAUSE_SENTENCE_SECONDS, MAGPIE_SAMPLE_RATE))
 
     async def write_next() -> None:
-        nonlocal previous
+        nonlocal previous, misses, dropped
 
         task, piece, utterance = pending.popleft()
 
@@ -246,23 +297,40 @@ async def _speak_magpie(
 
         previous = (piece, utterance.speaker)
 
+        if task is None:
+            await speak_on_edge(piece, utterance)
+            return
+
         try:
             writer(await task)
+            misses = 0
         except Exception as error:
             # One piece failing must not cost the rest of the story, so it is
             # read by the nearest edge-tts voice instead. The change is audible,
             # which is better than a hole where the sentence should be.
-            stand_in = edge_equivalent(utterance.voice)
+            misses += 1
+            # The reason lives on the cause: every attempt failed, and the
+            # RuntimeError raised at the end only says that it did. Logging the
+            # cause is the difference between "Magpie failed" and "the quota is
+            # gone", which are not the same problem.
+            reason = error.__cause__ or error
             logger.warning(
-                "Magpie could not speak %d chars as %s (%s: %s) — falling back "
-                "to %s",
+                "Magpie could not speak %d chars as %s (%s) — reading it in "
+                "edge-tts instead",
                 len(piece),
                 utterance.voice,
-                type(error).__name__,
-                error,
-                stand_in,
+                reason,
             )
-            writer(await _edge_bytes(piece, utterance, stand_in))
+
+            if misses >= MAGPIE_GIVE_UP_AFTER and not dropped:
+                dropped = True
+                logger.warning(
+                    "Magpie has refused %d pieces in a row — reading the rest of "
+                    "this story in edge-tts",
+                    misses,
+                )
+
+            await speak_on_edge(piece, utterance)
 
     try:
         async for utterance in cast:
@@ -282,17 +350,14 @@ async def _speak_magpie(
                 pieces = split_text(utterance.text)
 
             for piece in pieces:
-                pending.append(
-                    (
-                        asyncio.ensure_future(
-                            synthesize(
-                                piece, utterance.voice, tone, language, speed
-                            )
-                        ),
-                        piece,
-                        utterance,
+                task = (
+                    None
+                    if dropped
+                    else asyncio.ensure_future(
+                        synthesize(piece, utterance.voice, tone, language, speed)
                     )
                 )
+                pending.append((task, piece, utterance))
 
                 # Awaiting the head is the backpressure: no more than
                 # MAGPIE_PREFETCH pieces are ever being synthesised at once.
@@ -307,7 +372,14 @@ async def _speak_magpie(
         # Reached when the listener navigates away mid-story, which would
         # otherwise leave paid-for requests running with nowhere to go.
         for task, _, _ in pending:
-            if not task.done():
+            if task is None:
+                continue
+
+            if task.done():
+                # Retrieving the exception is what stops asyncio reporting it as
+                # never retrieved once the task is garbage collected.
+                task.exception()
+            else:
                 task.cancel()
 
     return spoken
@@ -317,6 +389,9 @@ async def generate_audio(state: TTSState):
     writer = get_stream_writer()
 
     voice = state["voice"]
+    language = language_of(state["text"])
+
+    voice = speakable(voice, language)
 
     if is_magpie(voice) and not magpie_enabled():
         # Deciding this once is the difference between a reading that starts
@@ -344,8 +419,9 @@ async def generate_audio(state: TTSState):
     # the engine for the whole reading; the cast is drawn from the matching
     # pool, so the two are never spliced together.
     if is_magpie(voice):
-        language = MAGPIE_LOCALES.get(language_of(state["text"]), "en-US")
-        spoken = await _speak_magpie(cast, writer, language)
+        spoken = await _speak_magpie(
+            cast, writer, MAGPIE_LOCALES.get(language, "en-US")
+        )
     else:
         spoken = await _speak_edge(cast, writer)
 
