@@ -30,6 +30,7 @@ from config import (
     NVIDIA_MODEL,
     casting_enabled,
 )
+from services.attribution import from_narration
 from services.magpie import is_magpie
 from services.names import match_key
 
@@ -654,16 +655,6 @@ async def identify_cast(text: str) -> dict[str, str]:
             # what every later batch is told to name its characters by.
             genders[name] = gender
 
-    if genders:
-        logger.info(
-            "Cast identified up front: %s",
-            ", ".join(
-                f"{entry.get('name')}={entry.get('gender')}"
-                for entry in parsed.get("cast", [])
-                if entry.get("name")
-            ),
-        )
-
     return genders
 
 
@@ -724,7 +715,6 @@ class VoiceAssigner:
         self.cast: dict[str, tuple[str, str, str]] = {}
         self.counts = {"male": 0, "female": 0}
         self.unnamed_turns = 0
-        self.guessed: set[str] = set()
         # Decided from the whole story, so it beats whatever a single batch
         # guessed from a fragment.
         self.known_genders: dict[str, str] = {}
@@ -779,13 +769,10 @@ class VoiceAssigner:
             gender = self._gender_for(speaker, gender)
 
             if gender not in self.pool:
-                # Nothing in the story settled it, so balance the two voices and
-                # remember that this one was a guess — if the gender turns up
-                # later, the casting can still be corrected.
+                # Nothing in the story settled it, so balance the two voices.
                 gender = (
                     "female" if self.counts["female"] <= self.counts["male"] else "male"
                 )
-                self.guessed.add(speaker)
 
             # In a pure script nobody narrates, so the plain unshifted voice is
             # free for the first character to use.
@@ -967,12 +954,6 @@ async def _cast_script(
                 error,
                 len(names),
             )
-    else:
-        logger.info(
-            "No NVIDIA_API_KEY: casting %d script characters by balance alone",
-            len(names),
-        )
-
     assigner = VoiceAssigner(
         voice,
         rate,
@@ -987,15 +968,6 @@ async def _cast_script(
     }
 
     utterances = _merge_adjacent(assigner.assign(segments, labels))
-
-    logger.info(
-        "Cast script: %d character(s) across %d line(s) — %s",
-        len(assigner.cast),
-        len(segments),
-        ", ".join(
-            f"{name}={assigner.gender_of(name) or 'balanced'}" for name in names
-        ),
-    )
 
     return utterances
 
@@ -1069,7 +1041,6 @@ async def iter_cast(
 
     if not remainder:
         cast_list.cancel()
-        logger.info("No dialogue found — narrating %d segments in one voice", len(lead))
         return
 
     try:
@@ -1081,6 +1052,12 @@ async def iter_cast(
             type(error).__name__,
             error,
         )
+
+    # Wherever the narration names the speaker outright, that is not a judgement
+    # call and the model does not get one. Read once over the whole remainder,
+    # so a line is attributed by the narration beside it even when the two land
+    # in different batches.
+    stated = from_narration(remainder, sorted(assigner.known_genders))
 
     batches = [
         remainder[start : start + CAST_BATCH_SIZE]
@@ -1139,33 +1116,26 @@ async def iter_cast(
             if queued < len(batches):
                 request(queued)
 
+            offset = position * CAST_BATCH_SIZE
+
+            for index in range(len(batch)):
+                speaker = stated.get(offset + index)
+
+                if speaker:
+                    # The gender the batch guessed is kept only as a fallback;
+                    # the cast list read from the whole story still wins.
+                    guessed = labels.get(index)
+                    labels[index] = Label(
+                        speaker=speaker,
+                        gender=guessed.gender if guessed else "neutral",
+                    )
+
             for utterance in assigner.assign(batch, labels):
                 yield utterance
     finally:
         for task in inflight:
             if not task.done():
                 task.cancel()
-
-    named = sorted(set(assigner.cast) - set(UNNAMED_SPEAKERS))
-
-    logger.info(
-        "Cast %d segments: %d named character(s) [%s], %d line(s) on stand-in voices",
-        len(segments),
-        len(named),
-        ", ".join(
-            f"{name}{'?' if name in assigner.guessed else ''}" for name in named
-        )
-        or "none",
-        assigner.unnamed_turns,
-    )
-
-    if assigner.guessed:
-        # Marked with ? above: the story never settled their gender, so the
-        # voice is a balance rather than a reading of the text.
-        logger.warning(
-            "Gender undetermined for %s — voice chosen by balance",
-            ", ".join(sorted(assigner.guessed)),
-        )
 
 
 async def merge_stream(utterances: AsyncIterator[Utterance]) -> AsyncIterator[Utterance]:
