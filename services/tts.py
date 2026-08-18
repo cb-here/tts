@@ -5,7 +5,12 @@ from collections.abc import AsyncIterator
 from config import (
     MAGPIE_OPENING_CHARS,
     MAGPIE_PREFETCH,
+    MAGPIE_SAMPLE_RATE,
     MAX_CONCURRENT_TTS,
+    PAUSE_CLAUSE_SECONDS,
+    PAUSE_DEFAULT_SECONDS,
+    PAUSE_SENTENCE_SECONDS,
+    PAUSE_SPEAKER_SECONDS,
     magpie_enabled,
 )
 from io import BytesIO
@@ -21,6 +26,7 @@ from services.casting import (
     language_of,
     merge_stream,
 )
+from services.audio import silence
 from services.magpie import is_magpie, split_text, synthesize
 from services import magpie
 from uuid import uuid4
@@ -52,6 +58,32 @@ SECONDS_PER_CHAR = 0.088
 # faster and higher, which is roughly what edge-tts does with the same number.
 HZ_PER_TONE = 500.0
 
+# edge-tts answers with audio-24khz-48kbitrate-mono-mp3. The silence spliced
+# between its pieces has to be cut at the same rate, or players stumble over the
+# sample rate changing mid-file.
+EDGE_SAMPLE_RATE = 24000
+
+SENTENCE_END = ("।", ".", "!", "?", "…")
+CLAUSE_END = (",", ";", ":", "—", "–")
+# Quotation marks are stripped from dialogue already, but a piece cut out of the
+# middle of a speech can still end on one.
+TRAILING_MARKS = "\"'”’»›」"
+
+
+def _pause_after(text: str, speaker_changes: bool) -> float:
+    """How long to hold before the next piece, read off the end of this one."""
+    ended = text.rstrip().rstrip(TRAILING_MARKS).rstrip()
+
+    if ended.endswith(SENTENCE_END):
+        gap = PAUSE_SENTENCE_SECONDS
+    elif ended.endswith(CLAUSE_END):
+        gap = PAUSE_CLAUSE_SECONDS
+    else:
+        gap = PAUSE_DEFAULT_SECONDS
+
+    # Someone else answering is a beat in its own right, even mid-sentence.
+    return max(gap, PAUSE_SPEAKER_SECONDS) if speaker_changes else gap
+
 
 def _percent(rate: str) -> float:
     try:
@@ -61,13 +93,22 @@ def _percent(rate: str) -> float:
 
 
 def _tone_of(utterance: Utterance) -> float:
-    """Fold an utterance's rate and pitch into one resampling factor."""
+    """How far to shift the voice itself, to tell this character from the rest."""
     try:
         hertz = int(utterance.pitch.strip().rstrip("Hz"))
     except (AttributeError, ValueError):
         hertz = 0
 
-    return (1 + _percent(utterance.rate)) * (1 + hertz / HZ_PER_TONE)
+    return 1 + hertz / HZ_PER_TONE
+
+
+def _speed_of(utterance: Utterance) -> float:
+    """How fast to read, with the voice left where it is.
+
+    Kept apart from the tone above because they are not the same request. Folded
+    together, asking for a slower story also asked for a deeper narrator.
+    """
+    return 1 + _percent(utterance.rate)
 
 
 def estimate_duration(text: str, rate: str, voice: str = "") -> float:
@@ -139,8 +180,19 @@ async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
 async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
     """Stream each utterance as edge-tts produces it."""
     spoken = 0
+    previous: Utterance | None = None
 
     async for utterance in cast:
+        if previous is not None:
+            writer(
+                silence(
+                    _pause_after(previous.text, previous.speaker != utterance.speaker),
+                    EDGE_SAMPLE_RATE,
+                )
+            )
+
+        previous = utterance
+
         communicate = Communicate(
             text=utterance.text,
             voice=utterance.voice,
@@ -176,9 +228,23 @@ async def _speak_magpie(
     pending: deque[tuple[asyncio.Task, str, Utterance]] = deque()
     spoken = 0
     opening = True
+    previous: tuple[str, str] | None = None
 
     async def write_next() -> None:
+        nonlocal previous
+
         task, piece, utterance = pending.popleft()
+
+        if previous is not None:
+            last_text, last_speaker = previous
+            writer(
+                silence(
+                    _pause_after(last_text, last_speaker != utterance.speaker),
+                    MAGPIE_SAMPLE_RATE,
+                )
+            )
+
+        previous = (piece, utterance.speaker)
 
         try:
             writer(await task)
@@ -201,6 +267,7 @@ async def _speak_magpie(
     try:
         async for utterance in cast:
             tone = _tone_of(utterance)
+            speed = _speed_of(utterance)
 
             if opening:
                 pieces = split_text(utterance.text, MAGPIE_OPENING_CHARS)
@@ -218,7 +285,9 @@ async def _speak_magpie(
                 pending.append(
                     (
                         asyncio.ensure_future(
-                            synthesize(piece, utterance.voice, tone, language)
+                            synthesize(
+                                piece, utterance.voice, tone, language, speed
+                            )
                         ),
                         piece,
                         utterance,

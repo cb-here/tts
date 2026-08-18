@@ -62,9 +62,21 @@ CASTING_REASONING_EFFORT = os.getenv("CASTING_REASONING_EFFORT", "low")
 TRANSLITERATE_MAX_CHARS = int(os.getenv("TRANSLITERATE_MAX_CHARS", "30000"))
 
 
+# A reading is stitched from pieces that were each synthesised alone, so the
+# silence between them is ours to place. Left at zero the last word of one piece
+# runs straight into the first of the next: no breath at a full stop, no beat
+# before someone answers, and the whole thing gallops. Lengths are taken from
+# the punctuation the piece ended on.
+PAUSE_SENTENCE_SECONDS = float(os.getenv("PAUSE_SENTENCE_SECONDS", "0.45"))
+PAUSE_CLAUSE_SECONDS = float(os.getenv("PAUSE_CLAUSE_SECONDS", "0.18"))
+PAUSE_DEFAULT_SECONDS = float(os.getenv("PAUSE_DEFAULT_SECONDS", "0.25"))
+# Held before a different voice comes in, whatever the punctuation said.
+PAUSE_SPEAKER_SECONDS = float(os.getenv("PAUSE_SPEAKER_SECONDS", "0.6"))
+
+
 # Finished audio is kept only long enough for the listener to press Download;
 # past that it is dead weight. Nothing survives a restart either way.
-AUDIO_TTL_SECONDS = float(os.getenv("AUDIO_TTL_SECONDS", "900"))
+AUDIO_TTL_SECONDS = float(os.getenv("AUDIO_TTL_SECONDS", "7200"))
 AUDIO_SWEEP_SECONDS = float(os.getenv("AUDIO_SWEEP_SECONDS", "120"))
 AUDIO_CACHE_MAX_MB = float(os.getenv("AUDIO_CACHE_MAX_MB", "300"))
 

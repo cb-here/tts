@@ -22,7 +22,7 @@ from config import (
     MAX_CONCURRENT_MAGPIE,
     NVIDIA_API_KEY,
 )
-from services.audio import encode_mp3, read_wav
+from services.audio import encode_mp3, read_wav, stretch
 
 logger = logging.getLogger(__name__)
 
@@ -216,13 +216,21 @@ async def _request(
 
 
 async def synthesize(
-    text: str, voice: str, tone: float = 1.0, language: str | None = None
+    text: str,
+    voice: str,
+    tone: float = 1.0,
+    language: str | None = None,
+    speed: float = 1.0,
 ) -> bytes:
     """Speak one piece, returning mp3 frames ready to splice into the stream.
 
     `language` describes the text, not the voice. Any speaker reads any of the
     supported languages, so this is what decides pronunciation — sending Hindi
     under en-US produces an English reading of Devanagari.
+
+    `speed` is how fast it is read and leaves the voice alone; `tone` shifts the
+    voice itself, and is what tells two characters apart once the pool runs out.
+    Magpie offers neither, so both are done to the audio afterwards.
     """
     last: Exception | None = None
     language = language or locale_of(voice)
@@ -236,7 +244,7 @@ async def synthesize(
                     wav = await _request(client, text, voice, language)
                     pcm, rate = read_wav(wav)
 
-                    return encode_mp3(pcm, rate, tone)
+                    return encode_mp3(stretch(pcm, speed), rate, tone)
                 except MagpieError as error:
                     last = error
 
