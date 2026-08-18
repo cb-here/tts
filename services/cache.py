@@ -66,8 +66,13 @@ def touch(path: Path) -> None:
 
 
 def discard(session_id: str) -> None:
-    for path in CACHE_DIR.glob(f"{session_id}*"):
-        _remove(path)
+    """Drop the finished audio for a session that is gone.
+
+    Deliberately only the published file. A ".part" belongs to a render that is
+    still running and cleans up after itself; deleting it here pulled the file
+    out from under a reading that was still being listened to.
+    """
+    _remove(cached_file(session_id))
 
 
 def _remove(path: Path) -> int:

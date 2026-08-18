@@ -56,9 +56,11 @@ MAX_CONCURRENT_MAGPIE = int(os.getenv("MAX_CONCURRENT_MAGPIE", "2"))
 # Casting is one blocking LLM call before the first audio byte, so keep it short.
 CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "45"))
 # Cost is driven by how many model calls the text creates, not by its length:
-# 50,000 characters of prose is 13 calls, while 20,000 of rapid dialogue is 53.
-# Capping the calls protects the free tier without punishing long prose.
-CASTING_MAX_BATCHES = int(os.getenv("CASTING_MAX_BATCHES", "40"))
+# long prose is cheap, rapid dialogue is not. Capping the calls protects the
+# free tier — but going over means the whole story is read in a single voice, so
+# the cap has to clear the longest story anyone actually pastes. Measured at
+# CAST_BATCH_SIZE 60: 100,000 characters of dialogue-heavy Hindi is 35 calls.
+CASTING_MAX_BATCHES = int(os.getenv("CASTING_MAX_BATCHES", "60"))
 # gpt-oss models think before answering. "medium" and "high" place lines with
 # their speakers more reliably, but the thinking happens on the one call the
 # first spoken word waits for, so the pause before audio roughly doubles a step.
@@ -76,6 +78,13 @@ PAUSE_CLAUSE_SECONDS = float(os.getenv("PAUSE_CLAUSE_SECONDS", "0.18"))
 PAUSE_DEFAULT_SECONDS = float(os.getenv("PAUSE_DEFAULT_SECONDS", "0.25"))
 # Held before a different voice comes in, whatever the punctuation said.
 PAUSE_SPEAKER_SECONDS = float(os.getenv("PAUSE_SPEAKER_SECONDS", "0.6"))
+
+
+# How long a parked text stays playable, counted from the last request for it.
+# It has to outlast the longest story anyone will read: 50,000 characters is
+# over an hour of speech, and losing the session mid-reading sends the player
+# back to the start.
+SESSION_TTL_SECONDS = float(os.getenv("SESSION_TTL_SECONDS", str(6 * 3600)))
 
 
 # Finished audio is kept only long enough for the listener to press Download;

@@ -267,10 +267,12 @@ def language_of(text: str) -> str:
 NARRATOR = "narrator"
 
 # Each batch costs one round trip regardless of its size, and the reply is only
-# a line per segment, so bigger batches are nearly free. Eight was small enough
-# that a long story needed dozens of calls and the casting fell behind the
-# reading; this covers several minutes of speech per call instead.
-CAST_BATCH_SIZE = 30
+# a line per segment, so bigger batches are nearly free. Measured: 80 segments
+# came back complete on 1,281 completion tokens against a 4,096 budget, and took
+# no longer than 30 did — the free tier's own variance dwarfs the size. Sixty
+# halves the calls a very long story needs, which is what decides whether it
+# gets cast at all.
+CAST_BATCH_SIZE = 60
 CAST_PREFETCH = 3
 CAST_CONTEXT_SEGMENTS = 3
 

@@ -168,6 +168,10 @@ def embed_text(state: TTSState):
 EDGE_RETRIES = 1
 EDGE_RETRY_SECONDS = 0.5
 
+# Multilingual, so it reads Devanagari and Latin alike. The last thing tried
+# before a line is given up on.
+LAST_RESORT_VOICE = "en-US-EmmaMultilingualNeural"
+
 
 async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
     """Speak one piece with edge-tts and hand back the whole thing at once."""
@@ -206,6 +210,38 @@ async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
     raise RuntimeError(f"edge-tts returned no audio for {len(text)} characters")
 
 
+async def _speak_fallback(
+    piece: str, utterance: Utterance, writer, rate: int
+) -> None:
+    """Get this piece spoken by something, or say plainly that it was lost.
+
+    The mapped stand-in first, then a voice known to read anything. A voice that
+    cannot pronounce the script at all answers with silence rather than an error,
+    and that is how whole passages went missing from a story before.
+    """
+    for voice in (edge_equivalent(utterance.voice), LAST_RESORT_VOICE):
+        try:
+            writer(await _edge_bytes(piece, utterance, voice))
+            return
+        except Exception as error:
+            logger.warning(
+                "%s could not speak %d chars (%s: %s)",
+                voice,
+                len(piece),
+                type(error).__name__,
+                error,
+            )
+
+    # Holding the beat keeps the reading moving instead of tearing the
+    # connection down, but part of the story is genuinely gone — not a warning.
+    logger.error(
+        "Dropped %d characters of the story — no voice would speak them: %r",
+        len(piece),
+        piece[:120],
+    )
+    writer(silence(PAUSE_SENTENCE_SECONDS, rate))
+
+
 async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
     """Stream each utterance as edge-tts produces it."""
     spoken = 0
@@ -229,10 +265,39 @@ async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
             pitch=utterance.pitch,
         )
 
-        async with _tts_slots:
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    writer(chunk["data"])
+        carried = 0
+
+        try:
+            async with _tts_slots:
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        writer(chunk["data"])
+                        carried += len(chunk["data"])
+        except Exception as error:
+            # Only safe to retry while nothing has gone out yet; past that the
+            # listener would hear the first half of the line twice.
+            if carried:
+                raise
+
+            logger.warning(
+                "%s failed part-way through %d chars (%s: %s)",
+                utterance.voice,
+                len(utterance.text),
+                type(error).__name__,
+                error,
+            )
+
+        if not carried:
+            # An utterance that produced nothing at all used to pass silently,
+            # and a merged run of narration is several sentences long — which is
+            # how five sentences at a time went missing from a story with
+            # nothing in the log to show it.
+            logger.warning(
+                "%s returned no audio for %d chars — trying again",
+                utterance.voice,
+                len(utterance.text),
+            )
+            await _speak_fallback(utterance.text, utterance, writer, EDGE_SAMPLE_RATE)
 
         spoken += 1
 
@@ -266,20 +331,7 @@ async def _speak_magpie(
     dropped = False
 
     async def speak_on_edge(piece: str, utterance: Utterance) -> None:
-        stand_in = edge_equivalent(utterance.voice)
-
-        try:
-            writer(await _edge_bytes(piece, utterance, stand_in))
-        except Exception as error:
-            # Both engines are out. Holding the beat keeps the reading moving
-            # instead of tearing the connection down over one lost sentence.
-            logger.warning(
-                "Neither engine could speak %d chars (%s: %s) — skipping it",
-                len(piece),
-                type(error).__name__,
-                error,
-            )
-            writer(silence(PAUSE_SENTENCE_SECONDS, MAGPIE_SAMPLE_RATE))
+        await _speak_fallback(piece, utterance, writer, MAGPIE_SAMPLE_RATE)
 
     async def write_next() -> None:
         nonlocal previous, misses, dropped
