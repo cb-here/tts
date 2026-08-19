@@ -38,11 +38,23 @@ async def generate(payload: TTSRequest):
 @router.post("/stream", response_model=TTSStreamSession)
 async def create_stream(payload: TTSStreamRequest):
     """Park the text and hand back a URL an `<audio>` element can play."""
+    chosen = payload.cast or {}
+
     session_id = create_session(
         text=payload.text,
         voice=payload.voice,
         rate=payload.rate,
         multi_voice=payload.multi_voice,
+        # Split in two because they are used at different points: the genders
+        # settle who a character is, the voices override what they sound like.
+        cast_genders={
+            name: member.gender
+            for name, member in chosen.items()
+            if member.gender != "neutral"
+        },
+        cast_voices={
+            name: member.voice for name, member in chosen.items() if member.voice
+        },
     )
 
     return TTSStreamSession(
@@ -93,6 +105,8 @@ async def stream(
                     voice=session.voice,
                     rate=session.rate,
                     multi_voice=session.multi_voice,
+                    cast_genders=session.cast_genders,
+                    cast_voices=session.cast_voices,
                 ):
                     handle.write(chunk)
                     yield chunk

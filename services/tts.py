@@ -49,6 +49,11 @@ class TTSState(TypedDict):
     voice: str
     rate: str
     multi_voice: bool
+    # Who the listener said each character is, and any voice they pinned. Empty
+    # when the reader was never opened on the cast, in which case the casting
+    # model works it out as before.
+    cast_genders: dict[str, str]
+    cast_voices: dict[str, str]
 
 
 # Measured against edge-tts Hindi output at +0%: 5407 chars produced 497s and
@@ -463,6 +468,8 @@ async def generate_audio(state: TTSState):
             voice=voice,
             rate=state["rate"],
             multi_voice=state.get("multi_voice", False),
+            cast_genders=state.get("cast_genders") or None,
+            cast_voices=state.get("cast_voices") or None,
         )
     )
 
@@ -500,6 +507,8 @@ async def stream_tts(
     voice: str,
     rate: str,
     multi_voice: bool = False,
+    cast_genders: dict[str, str] | None = None,
+    cast_voices: dict[str, str] | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield mp3 bytes as edge-tts produces them.
 
@@ -507,7 +516,14 @@ async def stream_tts(
     writer, so each chunk here is raw audio rather than a state update.
     """
     async for chunk in workflow.astream(
-        {"text": text, "voice": voice, "rate": rate, "multi_voice": multi_voice},
+        {
+            "text": text,
+            "voice": voice,
+            "rate": rate,
+            "multi_voice": multi_voice,
+            "cast_genders": cast_genders or {},
+            "cast_voices": cast_voices or {},
+        },
         stream_mode="custom",
     ):
         yield chunk

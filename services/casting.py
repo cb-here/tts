@@ -741,6 +741,7 @@ class VoiceAssigner:
         has_narration: bool = True,
         known_genders: dict[str, str] | None = None,
         language: str = "hi",
+        pinned: dict[str, str] | None = None,
     ):
         self.base_voice = base_voice
         self.base_rate = base_rate
@@ -756,6 +757,26 @@ class VoiceAssigner:
         # particular batch chose to spell them.
         self._gender_by_key: dict[str, str] = {}
         self._canonical: dict[str, str] = {}
+        self._pinned: dict[str, str] = {}
+
+        for name, choice in (pinned or {}).items():
+            key = match_key(name)
+
+            # A voice from the other engine cannot go in the same reading: the
+            # narrator's voice decides whether the whole thing is spoken by
+            # Magpie or by edge-tts, and a piece from the wrong one is sent to
+            # an API that has never heard of it. Dropping the pin leaves the
+            # character with a chosen voice from the right pool instead.
+            if key and is_magpie(choice) == is_magpie(base_voice):
+                self._pinned[key] = speakable(choice, language)
+            elif key:
+                logger.warning(
+                    "Ignoring the voice pinned to %s (%s): it is not from the "
+                    "same engine as the narrator (%s)",
+                    name,
+                    choice,
+                    base_voice,
+                )
 
         self.learn_cast(known_genders or {})
 
@@ -800,6 +821,14 @@ class VoiceAssigner:
 
     def _voice_for(self, speaker: str, gender: str) -> tuple[str, str, str]:
         if speaker not in self.cast:
+            chosen = self._pinned.get(match_key(speaker))
+
+            if chosen:
+                # Asked for by name, so it is not balanced, shifted or pitched —
+                # it is simply used.
+                self.cast[speaker] = (chosen, self.base_rate, "+0Hz")
+                return self.cast[speaker]
+
             gender = self._gender_for(speaker, gender)
 
             if gender not in self.pool:
@@ -970,12 +999,15 @@ async def _cast_script(
     voice: str,
     rate: str,
     text: str,
+    cast_genders: dict[str, str] | None = None,
+    cast_voices: dict[str, str] | None = None,
 ) -> list[Utterance]:
     """Cast a screenplay, where every line already names its speaker."""
     names = sorted({segment.speaker for segment in segments if segment.speaker})
-    genders: dict[str, str] = {}
+    genders: dict[str, str] = dict(cast_genders or {})
 
-    if casting_enabled():
+    # Nothing to ask: the listener already said who everyone is.
+    if not genders and casting_enabled():
         try:
             # Read the script itself rather than just the cast list: the lines
             # carry gendered verbs, and a name alone often settles nothing.
@@ -994,6 +1026,7 @@ async def _cast_script(
         has_narration=any(not segment.is_dialogue for segment in segments),
         known_genders=genders,
         language=language_of(" ".join(s.text for s in segments[:20])),
+        pinned=cast_voices,
     )
     labels = {
         index: Label(segment.speaker)
@@ -1011,6 +1044,8 @@ async def iter_cast(
     voice: str,
     rate: str,
     multi_voice: bool = False,
+    cast_genders: dict[str, str] | None = None,
+    cast_voices: dict[str, str] | None = None,
 ) -> AsyncIterator[Utterance]:
     """Plan the read-through, yielding lines as soon as they are cast.
 
@@ -1033,7 +1068,9 @@ async def iter_cast(
         # Screenplay format. Who speaks is already written down, so the model is
         # asked nothing but the genders — and if it is unavailable the reading
         # is still fully cast, just with the voices balanced by guesswork.
-        for utterance in await _cast_script(segments, voice, rate, text):
+        for utterance in await _cast_script(
+            segments, voice, rate, text, cast_genders, cast_voices
+        ):
             yield utterance
         return
 
@@ -1064,9 +1101,19 @@ async def iter_cast(
         return
 
     # Started before anything else and awaited only when the first character
-    # actually needs a voice, so the opening narration covers its cost.
-    cast_list = asyncio.ensure_future(identify_cast(text))
-    assigner = VoiceAssigner(voice, rate, language=language_of(text))
+    # actually needs a voice, so the opening narration covers its cost. Skipped
+    # outright when the listener has already settled the cast in the reader —
+    # that call existed only to guess what they have now simply said.
+    cast_list = (
+        None if cast_genders else asyncio.ensure_future(identify_cast(text))
+    )
+    assigner = VoiceAssigner(
+        voice,
+        rate,
+        language=language_of(text),
+        known_genders=cast_genders,
+        pinned=cast_voices,
+    )
 
     lead_utterances: list[Utterance] = assigner.assign(lead, {}) if lead else []
 
@@ -1074,18 +1121,20 @@ async def iter_cast(
         yield utterance
 
     if not remainder:
-        cast_list.cancel()
+        if cast_list:
+            cast_list.cancel()
         return
 
-    try:
-        assigner.learn_cast(await cast_list)
-    except Exception as error:
-        logger.warning(
-            "Could not read the cast up front (%s: %s) — genders fall back to "
-            "whatever each batch reports",
-            type(error).__name__,
-            error,
-        )
+    if cast_list:
+        try:
+            assigner.learn_cast(await cast_list)
+        except Exception as error:
+            logger.warning(
+                "Could not read the cast up front (%s: %s) — genders fall back "
+                "to whatever each batch reports",
+                type(error).__name__,
+                error,
+            )
 
     # Wherever the narration names the speaker outright, that is not a judgement
     # call and the model does not get one. Read once over the whole remainder,

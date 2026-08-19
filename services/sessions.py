@@ -16,6 +16,11 @@ class TTSSession:
     rate: str
     multi_voice: bool
     created_at: float
+    # A cast the listener settled in the reader, name → gender and name → voice.
+    # Parked with the text because the stream is fetched separately, and by then
+    # the request that carried it is long gone.
+    cast_genders: dict[str, str] = field(default_factory=dict)
+    cast_voices: dict[str, str] = field(default_factory=dict)
     # Measured from the last time the stream was asked for, not from when the
     # text was parked. A 50,000-character story is over an hour of audio, so a
     # window counted from creation expires while it is still being read aloud —
@@ -46,7 +51,14 @@ def _prune(now: float) -> None:
         _forget(min(_sessions, key=lambda key: _sessions[key].touched_at))
 
 
-def create_session(text: str, voice: str, rate: str, multi_voice: bool = False) -> str:
+def create_session(
+    text: str,
+    voice: str,
+    rate: str,
+    multi_voice: bool = False,
+    cast_genders: dict[str, str] | None = None,
+    cast_voices: dict[str, str] | None = None,
+) -> str:
     now = monotonic()
     _prune(now)
 
@@ -58,6 +70,8 @@ def create_session(text: str, voice: str, rate: str, multi_voice: bool = False) 
         multi_voice=multi_voice,
         created_at=now,
         touched_at=now,
+        cast_genders=cast_genders or {},
+        cast_voices=cast_voices or {},
     )
 
     return session_id
