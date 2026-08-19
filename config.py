@@ -62,10 +62,6 @@ MAGPIE_MAX_CHARS = int(os.getenv("MAGPIE_MAX_CHARS", "700"))
 # one — about a second and a half — and settles into full-length pieces after.
 MAGPIE_OPENING_CHARS = int(os.getenv("MAGPIE_OPENING_CHARS", "220"))
 MAGPIE_TIMEOUT_SECONDS = float(os.getenv("MAGPIE_TIMEOUT_SECONDS", "90"))
-# Consecutive refusals before a reading stops asking Magpie at all. The free
-# tier tends to refuse in stretches rather than one-offs, and each refused piece
-# costs its whole retry budget before falling back regardless.
-MAGPIE_GIVE_UP_AFTER = int(os.getenv("MAGPIE_GIVE_UP_AFTER", "3"))
 # In flight at once, per key. Four is the most a single burst gets away with —
 # the fifth is refused — and the cap is counted per key rather than per account:
 # four on each of two keys went through together, which is what makes a second

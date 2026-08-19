@@ -86,9 +86,15 @@ MAX_BACKOFF_SECONDS = 12.0
 # properly.
 MIN_INTERVAL_SECONDS = float(os.getenv("MAGPIE_MIN_INTERVAL", "1.0"))
 
-# Failures in a row before the service is left alone entirely, and for how long.
+# Failures in a row on one key before it is left alone, and for how long.
+#
+# A minute, not ten. Ten was set for a spent quota, which is worth waiting out
+# because it will not clear. What actually happens is 429 — too many in flight,
+# which clears in seconds — and benching a key for ten minutes over that hands
+# most of a long story to edge-tts. Short enough that a blip costs a minute of
+# the plainer voice, and the reading gets Magpie back.
 BREAKER_LIMIT = 4
-BREAKER_COOLDOWN_SECONDS = 600.0
+BREAKER_COOLDOWN_SECONDS = float(os.getenv("MAGPIE_COOLDOWN_SECONDS", "60"))
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 RETRYABLE_MESSAGE = "mapping failed"
@@ -181,10 +187,10 @@ class Breaker:
             )
             logger.warning(
                 "Magpie has refused %d requests in a row on %s — leaving that "
-                "key alone for %.0f minutes",
+                "key alone for %.0fs",
                 self._misses,
                 self._label,
-                self._cooldown / 60,
+                self._cooldown,
             )
             self._misses = 0
 

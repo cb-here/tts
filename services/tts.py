@@ -3,7 +3,6 @@ import logging
 from collections import deque
 from collections.abc import AsyncIterator
 from config import (
-    MAGPIE_GIVE_UP_AFTER,
     MAGPIE_OPENING_CHARS,
     MAGPIE_PREFETCH,
     MAGPIE_SAMPLE_RATE,
@@ -215,27 +214,56 @@ async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
     raise RuntimeError(f"edge-tts returned no audio for {len(text)} characters")
 
 
+# Both stand-ins are the same service. When edge-tts starts refusing, neither
+# answers — and the ladder as it stood conceded after about two seconds, wrote a
+# beat of silence, and moved on. Once Magpie has been given up on, every piece
+# left in the story arrives here, so that concession is not one lost sentence:
+# it is the rest of the reading turning silent, which is exactly what a listener
+# sees ten minutes into a long story.
+#
+# Waiting costs a pause the browser's buffer absorbs. Conceding costs the story.
+FALLBACK_ROUNDS = 4
+FALLBACK_BACKOFF_SECONDS = 3.0
+MAX_FALLBACK_BACKOFF_SECONDS = 20.0
+
+
 async def _speak_fallback(
     piece: str, utterance: Utterance, writer, rate: int
 ) -> None:
     """Get this piece spoken by something, or say plainly that it was lost.
 
-    The mapped stand-in first, then a voice known to read anything. A voice that
-    cannot pronounce the script at all answers with silence rather than an error,
-    and that is how whole passages went missing from a story before.
+    The mapped stand-in first, then a voice known to read anything, and then the
+    pair again after a wait — a throttled service is refusing for now rather than
+    for good, and it is worth outlasting.
     """
-    for voice in (edge_equivalent(utterance.voice), LAST_RESORT_VOICE):
-        try:
-            writer(await _edge_bytes(piece, utterance, voice))
-            return
-        except Exception as error:
-            logger.warning(
-                "%s could not speak %d chars (%s: %s)",
-                voice,
-                len(piece),
-                type(error).__name__,
-                error,
+    for attempt in range(FALLBACK_ROUNDS):
+        for voice in (edge_equivalent(utterance.voice), LAST_RESORT_VOICE):
+            try:
+                writer(await _edge_bytes(piece, utterance, voice))
+                return
+            except Exception as error:
+                logger.warning(
+                    "%s could not speak %d chars (%s: %s)",
+                    voice,
+                    len(piece),
+                    type(error).__name__,
+                    error,
+                )
+
+        if attempt + 1 < FALLBACK_ROUNDS:
+            wait = min(
+                MAX_FALLBACK_BACKOFF_SECONDS,
+                FALLBACK_BACKOFF_SECONDS * 2**attempt,
             )
+            logger.warning(
+                "No voice would speak %d chars — waiting %.0fs and asking again "
+                "(round %d of %d)",
+                len(piece),
+                wait,
+                attempt + 1,
+                FALLBACK_ROUNDS,
+            )
+            await asyncio.sleep(wait)
 
     # Holding the beat keeps the reading moving instead of tearing the
     # connection down, but part of the story is genuinely gone — not a warning.
@@ -324,22 +352,19 @@ async def _speak_magpie(
     gap before every one. Several are requested at once instead, while the
     output stays strictly in reading order.
     """
-    pending: deque[tuple[asyncio.Task | None, str, Utterance]] = deque()
+    pending: deque[tuple[asyncio.Task, str, Utterance]] = deque()
     spoken = 0
     opening = True
     previous: tuple[str, str] | None = None
-    # Once the free tier starts refusing it usually keeps refusing, and every
-    # piece then spends its whole retry budget before falling back anyway. After
-    # a few in a row the reading gives up on Magpie and simply reads in edge-tts
-    # — far quicker than grinding through the backoff for every line left.
+    # Counted only to report how a reading went. Whether to keep asking Magpie
+    # is the breaker's decision, and it is made per key rather than per story.
     misses = 0
-    dropped = False
 
     async def speak_on_edge(piece: str, utterance: Utterance) -> None:
         await _speak_fallback(piece, utterance, writer, MAGPIE_SAMPLE_RATE)
 
     async def write_next() -> None:
-        nonlocal previous, misses, dropped
+        nonlocal previous, misses
 
         task, piece, utterance = pending.popleft()
 
@@ -353,10 +378,6 @@ async def _speak_magpie(
             )
 
         previous = (piece, utterance.speaker)
-
-        if task is None:
-            await speak_on_edge(piece, utterance)
-            return
 
         try:
             writer(await task)
@@ -379,14 +400,6 @@ async def _speak_magpie(
                 reason,
             )
 
-            if misses >= MAGPIE_GIVE_UP_AFTER and not dropped:
-                dropped = True
-                logger.warning(
-                    "Magpie has refused %d pieces in a row — reading the rest of "
-                    "this story in edge-tts",
-                    misses,
-                )
-
             await speak_on_edge(piece, utterance)
 
     try:
@@ -407,12 +420,14 @@ async def _speak_magpie(
                 pieces = split_text(utterance.text)
 
             for piece in pieces:
-                task = (
-                    None
-                    if dropped
-                    else asyncio.ensure_future(
-                        synthesize(piece, utterance.voice, tone, language, speed)
-                    )
+                # Always asked. When every key is inside its cooldown the
+                # call fails at once without spending a retry, which is what the
+                # give-up flag used to be for — except that flag never lifted,
+                # so a handful of transient refusals sent the whole rest of the
+                # story to edge-tts and left it there. The breaker holds Magpie
+                # back for a minute and then lets the reading have it again.
+                task = asyncio.ensure_future(
+                    synthesize(piece, utterance.voice, tone, language, speed)
                 )
                 pending.append((task, piece, utterance))
 
