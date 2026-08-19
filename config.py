@@ -62,19 +62,27 @@ MAGPIE_MAX_CHARS = int(os.getenv("MAGPIE_MAX_CHARS", "700"))
 # one — about a second and a half — and settles into full-length pieces after.
 MAGPIE_OPENING_CHARS = int(os.getenv("MAGPIE_OPENING_CHARS", "220"))
 MAGPIE_TIMEOUT_SECONDS = float(os.getenv("MAGPIE_TIMEOUT_SECONDS", "90"))
-# In flight at once, per key. Four is the most a single burst gets away with —
-# the fifth is refused — and the cap is counted per key rather than per account:
-# four on each of two keys went through together, which is what makes a second
-# key worth having.
+# In flight at once, per key — four, which is what the service allows: four at a
+# time are answered and the fifth is refused. The cap is counted per key, not per
+# account (four on each of two keys went through together), so two keys carry
+# eight and that is what a reading gets.
 #
-# Two, not four. Reading at the ceiling leaves nothing for a retry, and a refused
-# piece costs more than a slow one — three in a row hand the rest of the story to
-# edge-tts. Attempts to tune this upward against whole readings were not
-# trustworthy: the refusal count rose with how much the key had been used that
-# hour, not with the setting.
-MAX_CONCURRENT_MAGPIE = int(os.getenv("MAX_CONCURRENT_MAGPIE", "2"))
-# Pieces kept in flight ahead of the one being written out.
-MAGPIE_PREFETCH = int(os.getenv("MAGPIE_PREFETCH", "3"))
+# It has to be this high. A reading is not slow because it is throttled, it is
+# slow because each request takes about twenty seconds and a 30,000-character
+# story makes eight hundred of them: at four in flight that renders at 0.89x real
+# time, which is slower than the listener plays it, so the audio runs out mid-
+# story. Eight is what puts the reading back in front.
+#
+# Refusals do not cost what they used to. A 429 now sends that one piece to
+# edge-tts and nothing more — no give-up flag, no rest-of-the-story fallback —
+# and edge streams, so it is if anything quicker.
+MAX_CONCURRENT_MAGPIE = int(os.getenv("MAX_CONCURRENT_MAGPIE", "4"))
+# Pieces kept in flight ahead of the one being written out, and the real ceiling
+# on concurrency: only this many are ever in the air, so left below what the keys
+# allow it is the prefetch throttling the reading rather than the service.
+MAGPIE_PREFETCH = int(
+    os.getenv("MAGPIE_PREFETCH", str(MAX_CONCURRENT_MAGPIE * 2))
+)
 
 # Casting is one blocking LLM call before the first audio byte, so keep it short.
 CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "45"))
