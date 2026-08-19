@@ -456,7 +456,7 @@ async def generate_audio(state: TTSState):
         # then re-spoken by the stand-in.
         stand_in = edge_equivalent(voice)
         logger.warning(
-            "NVIDIA_API_KEY is not set, so %s is unavailable — reading in %s",
+            "No key for the Magpie voices, so %s is unavailable — reading in %s",
             voice,
             stand_in,
         )

@@ -19,8 +19,27 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "openai/gpt-oss-20b")
 
+# Keys the reading may speak on, tried in turn. Comma-separated.
+#
+# What a reading spends is requests, not characters. A multi-voice reading cannot
+# merge across speakers — every turn is a different voice — so 2,370 characters
+# of dialogue leaves as 61 requests averaging 36 characters each, against a
+# 700-character cap. Raising the cap changes nothing: there is never enough text
+# in one voice to fill a request.
+#
+# What the service caps is how many are in flight, and that is counted per key —
+# four on each of two keys went through together where eight on one did not. So
+# a second key is a second set of slots, and it also keeps speech from competing
+# with the casting model, which draws on NVIDIA_API_KEY. Left unset, speech runs
+# on that same key exactly as before.
+MAGPIE_API_KEYS = [
+    key.strip()
+    for key in os.getenv("MAGPIE_API_KEY", "").split(",")
+    if key.strip()
+] or ([NVIDIA_API_KEY] if NVIDIA_API_KEY else [])
 
-# NVIDIA's Magpie TTS, reached through the same key as the casting model. It
+
+# NVIDIA's Magpie TTS, spoken on MAGPIE_API_KEYS above. It
 # reads more naturally than edge-tts and about 13x faster than real time, but it
 # hands back a whole WAV rather than a stream, so the reading is cut into pieces
 # and the pieces are synthesised ahead of the playhead.
@@ -42,16 +61,24 @@ MAGPIE_MAX_CHARS = int(os.getenv("MAGPIE_MAX_CHARS", "700"))
 # Nothing plays until the first piece lands, so the reading opens with a short
 # one — about a second and a half — and settles into full-length pieces after.
 MAGPIE_OPENING_CHARS = int(os.getenv("MAGPIE_OPENING_CHARS", "220"))
-# Pieces kept in flight ahead of the one being written out.
-MAGPIE_PREFETCH = int(os.getenv("MAGPIE_PREFETCH", "3"))
 MAGPIE_TIMEOUT_SECONDS = float(os.getenv("MAGPIE_TIMEOUT_SECONDS", "90"))
 # Consecutive refusals before a reading stops asking Magpie at all. The free
 # tier tends to refuse in stretches rather than one-offs, and each refused piece
 # costs its whole retry budget before falling back regardless.
 MAGPIE_GIVE_UP_AFTER = int(os.getenv("MAGPIE_GIVE_UP_AFTER", "3"))
-# The free tier answers a short burst and then throttles, and at 13x real time
-# there is no need to push it — two in flight already outruns the listener.
+# In flight at once, per key. Four is the most a single burst gets away with —
+# the fifth is refused — and the cap is counted per key rather than per account:
+# four on each of two keys went through together, which is what makes a second
+# key worth having.
+#
+# Two, not four. Reading at the ceiling leaves nothing for a retry, and a refused
+# piece costs more than a slow one — three in a row hand the rest of the story to
+# edge-tts. Attempts to tune this upward against whole readings were not
+# trustworthy: the refusal count rose with how much the key had been used that
+# hour, not with the setting.
 MAX_CONCURRENT_MAGPIE = int(os.getenv("MAX_CONCURRENT_MAGPIE", "2"))
+# Pieces kept in flight ahead of the one being written out.
+MAGPIE_PREFETCH = int(os.getenv("MAGPIE_PREFETCH", "3"))
 
 # Casting is one blocking LLM call before the first audio byte, so keep it short.
 CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "45"))
@@ -105,5 +132,4 @@ def casting_enabled() -> bool:
 
 
 def magpie_enabled() -> bool:
-    # Same key as casting, so a deployment either has both or neither.
-    return bool(NVIDIA_API_KEY)
+    return bool(MAGPIE_API_KEYS)

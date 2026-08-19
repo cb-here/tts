@@ -9,6 +9,8 @@ the pieces synthesised ahead of the one being played.
 
 import asyncio
 import logging
+import itertools
+import os
 import random
 import re
 
@@ -19,14 +21,18 @@ from config import (
     MAGPIE_SAMPLE_RATE,
     MAGPIE_TIMEOUT_SECONDS,
     MAGPIE_URL,
+    MAGPIE_API_KEYS,
     MAX_CONCURRENT_MAGPIE,
-    NVIDIA_API_KEY,
 )
 from services.audio import encode_mp3, read_wav, stretch
 
 logger = logging.getLogger(__name__)
 
-_magpie_slots = asyncio.Semaphore(MAX_CONCURRENT_MAGPIE)
+# Per key, since that is what the limit is counted against. Two keys are two
+# budgets and can be in flight at once.
+_magpie_slots = asyncio.Semaphore(
+    MAX_CONCURRENT_MAGPIE * max(1, len(MAGPIE_API_KEYS))
+)
 
 VOICE_PREFIX = "Magpie-"
 
@@ -42,6 +48,21 @@ CLAUSE_BREAK = re.compile(r"(?<=[,;:—–])\s+")
 # 39.0s and 78.4s — a little quicker than edge-tts.
 SECONDS_PER_CHAR = 0.077
 
+# Magpie answers 200 OK with a well-formed but empty WAV when it is struggling,
+# and an empty WAV encodes to a perfectly valid mp3 of nothing but header. Spliced
+# into the stream that is a paragraph which is simply never read aloud — no
+# exception, no retry, no fallback, and nothing in the log to say it happened.
+# Checking the length of what came back is what turns that silent hole into an
+# ordinary refusal the retry ladder already knows how to handle.
+MIN_AUDIO_SECONDS = 0.05
+# A reply far shorter than the text warrants was cut off rather than left empty.
+# Kept generous: how long a piece takes to read varies with the script and the
+# speaker, and a wrong rejection costs a retry and an audibly different voice.
+MIN_AUDIO_FRACTION = 0.25
+# Under this there is not enough text for the proportion to mean anything —
+# "ठीक है।" is over in a moment however it is read.
+FRACTION_MIN_CHARS = 40
+
 # The free tier allows a burst and then throttles, so a refusal is a wait rather
 # than a no. It does not always say so politely: under the same load it answers
 # 400 "Mapping failed" on text it speaks perfectly well once it has caught up —
@@ -54,7 +75,16 @@ MAX_BACKOFF_SECONDS = 12.0
 # the free tier answers steadily, while a burst buys a few quick replies and
 # then a hold several times longer than it saved. The service is shared, so how
 # much gets through also varies with who else is using it.
-MIN_INTERVAL_SECONDS = 1.0
+#
+# Probing this directly finds nothing — fifteen requests back to back on one key
+# were all answered, and 429 is what too many in flight looks like rather than
+# too fast. Whole readings are the only honest measurement and they are not
+# cheap to repeat: five runs of the same story drew 5, 3, 6, 6 and 8 refusals in
+# that order, and the count tracked how much the key had been used that hour
+# rather than anything that was changed between them. So this is left where it
+# was, and made settable for anyone with a fresh key and the patience to time it
+# properly.
+MIN_INTERVAL_SECONDS = float(os.getenv("MAGPIE_MIN_INTERVAL", "1.0"))
 
 # Failures in a row before the service is left alone entirely, and for how long.
 BREAKER_LIMIT = 4
@@ -128,9 +158,10 @@ class Breaker:
     the reading starts on the other engine rather than crawling.
     """
 
-    def __init__(self, limit: int, cooldown: float):
+    def __init__(self, limit: int, cooldown: float, label: str = "Magpie"):
         self._limit = limit
         self._cooldown = cooldown
+        self._label = label
         self._misses = 0
         self._open_until = 0.0
 
@@ -149,16 +180,58 @@ class Breaker:
                 asyncio.get_running_loop().time() + self._cooldown
             )
             logger.warning(
-                "Magpie has refused %d requests in a row — leaving it alone for "
-                "%.0f minutes and reading in edge-tts",
+                "Magpie has refused %d requests in a row on %s — leaving that "
+                "key alone for %.0f minutes",
                 self._misses,
+                self._label,
                 self._cooldown / 60,
             )
             self._misses = 0
 
 
-_pacer = Pacer(MIN_INTERVAL_SECONDS)
-_breaker = Breaker(BREAKER_LIMIT, BREAKER_COOLDOWN_SECONDS)
+class Key:
+    """One API key, with the pacing and the circuit breaker that belong to it.
+
+    Both have to be per key or a second key buys nothing. Sharing one pacer
+    holds the pair to the rate of a single key, and sharing one breaker takes
+    the healthy key out of service the moment the other one is throttled.
+    """
+
+    def __init__(self, secret: str):
+        self.secret = secret
+        self.pacer = Pacer(MIN_INTERVAL_SECONDS)
+        self.breaker = Breaker(
+            BREAKER_LIMIT, BREAKER_COOLDOWN_SECONDS, label=str(self)
+        )
+
+    def __str__(self) -> str:
+        # Enough to tell two keys apart in a log, and no more than that.
+        return f"key …{self.secret[-4:]}"
+
+
+_keys = [Key(secret) for secret in MAGPIE_API_KEYS]
+_turn = itertools.count()
+
+
+def _take_key() -> Key | None:
+    """The next key that is not in its cooldown, taken in rotation.
+
+    Round robin rather than "first that works": spreading the requests is the
+    whole point, and always starting at the front would exhaust one key before
+    touching the next.
+    """
+    if not _keys:
+        return None
+
+    start = next(_turn)
+
+    for offset in range(len(_keys)):
+        key = _keys[(start + offset) % len(_keys)]
+
+        if not key.breaker.is_open():
+            return key
+
+    return None
 
 
 def is_magpie(voice: str) -> bool:
@@ -236,12 +309,36 @@ def split_text(text: str, limit: int = MAGPIE_MAX_CHARS) -> list[str]:
     return pieces or [text]
 
 
+def _short_reply(pcm: bytes, rate: int, text: str) -> str | None:
+    """Why this audio cannot be a reading of `text`, if it cannot be."""
+    # 16-bit mono, which is what the request asks for.
+    seconds = len(pcm) / (rate * 2) if rate else 0.0
+
+    # Punctuation on its own is allowed to come back as next to nothing.
+    if not any(character.isalnum() for character in text):
+        return None
+
+    if seconds < MIN_AUDIO_SECONDS:
+        return f"{seconds * 1000:.0f}ms of audio for {len(text)} characters"
+
+    if len(text) >= FRACTION_MIN_CHARS:
+        expected = len(text) * SECONDS_PER_CHAR
+
+        if seconds < expected * MIN_AUDIO_FRACTION:
+            return (
+                f"{seconds:.1f}s of audio for {len(text)} characters, "
+                f"where about {expected:.0f}s was due"
+            )
+
+    return None
+
+
 async def _request(
-    client: httpx.AsyncClient, text: str, voice: str, language: str
+    client: httpx.AsyncClient, text: str, voice: str, language: str, secret: str
 ) -> bytes:
     response = await client.post(
         MAGPIE_URL,
-        headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
+        headers={"Authorization": f"Bearer {secret}"},
         files={
             "text": (None, text),
             "language": (None, language),
@@ -278,20 +375,31 @@ async def synthesize(
     """
     last: Exception | None = None
     language = language or locale_of(voice)
+    key = _take_key()
 
-    if _breaker.is_open():
+    if key is None:
         raise RuntimeError("Magpie is not answering; not asking again yet")
 
     async with _magpie_slots:
         async with httpx.AsyncClient(timeout=MAGPIE_TIMEOUT_SECONDS) as client:
             for attempt in range(RETRIES + 1):
-                await _pacer.wait()
+                await key.pacer.wait()
 
                 try:
-                    wav = await _request(client, text, voice, language)
+                    wav = await _request(
+                        client, text, voice, language, key.secret
+                    )
                     pcm, rate = read_wav(wav)
 
-                    _breaker.succeeded()
+                    cut = _short_reply(pcm, rate, text)
+
+                    if cut:
+                        # A ValueError here is retried and then falls back, which
+                        # is what a refusal deserves. Letting it through instead
+                        # publishes silence as though it were the reading.
+                        raise ValueError(f"Magpie returned {cut}")
+
+                    key.breaker.succeeded()
 
                     return encode_mp3(stretch(pcm, speed), rate, tone)
                 except MagpieError as error:
@@ -311,18 +419,21 @@ async def synthesize(
                     MAX_BACKOFF_SECONDS, BACKOFF_SECONDS * 2**attempt
                 ) * random.uniform(0.7, 1.0)
 
-                _pacer.throttled(cooldown)
+                # Only this key is held back. The other one is on its own
+                # budget and has no reason to wait.
+                key.pacer.throttled(cooldown)
 
                 logger.info(
-                    "Magpie deferred %d chars on %s (%s) — holding every request "
-                    "for %.1fs",
+                    "Magpie deferred %d chars on %s via %s (%s) — holding that "
+                    "key for %.1fs",
                     len(text),
                     voice,
+                    key,
                     last,
                     cooldown,
                 )
 
-    _breaker.failed()
+    key.breaker.failed()
 
     raise RuntimeError(
         f"Magpie could not speak {len(text)} characters as {voice}"
