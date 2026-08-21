@@ -84,14 +84,18 @@ MAGPIE_PREFETCH = int(
     os.getenv("MAGPIE_PREFETCH", str(MAX_CONCURRENT_MAGPIE * 2))
 )
 
-# Casting is one blocking LLM call before the first audio byte, so keep it short.
-CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "45"))
+# Casting is one blocking call before the first spoken word, so it wants to be
+# short — but a timeout is not a saving. Every batch of a 15,000-character story
+# hit 45 seconds on a slow host and the whole reading went out in stand-in
+# voices. Waiting longer costs a pause; giving up costs the cast.
+CASTING_TIMEOUT_SECONDS = float(os.getenv("CASTING_TIMEOUT_SECONDS", "120"))
 # Cost is driven by how many model calls the text creates, not by its length:
 # long prose is cheap, rapid dialogue is not. Capping the calls protects the
 # free tier — but going over means the whole story is read in a single voice, so
-# the cap has to clear the longest story anyone actually pastes. Measured at
-# CAST_BATCH_SIZE 60: 100,000 characters of dialogue-heavy Hindi is 35 calls.
-CASTING_MAX_BATCHES = int(os.getenv("CASTING_MAX_BATCHES", "60"))
+# the cap has to clear the longest story anyone actually pastes. Raised with
+# CAST_BATCH_SIZE coming down to 24: the same story now makes more calls, and
+# the cap is about what the API can bear, not about the batch size.
+CASTING_MAX_BATCHES = int(os.getenv("CASTING_MAX_BATCHES", "150"))
 # gpt-oss models think before answering. "medium" and "high" place lines with
 # their speakers more reliably, but the thinking happens on the one call the
 # first spoken word waits for, so the pause before audio roughly doubles a step.

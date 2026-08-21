@@ -345,64 +345,31 @@ MAGPIE_LOCALES = {"hi": "hi-IN", "en": "en-US"}
 async def _speak_magpie(
     cast: AsyncIterator[Utterance], writer, language: str
 ) -> int:
-    """Synthesise ahead of the playhead, then write the pieces out in order.
+    """Synthesise ahead of the playhead, writing the pieces out in order.
 
     Magpie returns a finished WAV rather than a stream, so a piece being spoken
     would otherwise be the only work in flight and the listener would hear the
     gap before every one. Several are requested at once instead, while the
     output stays strictly in reading order.
+
+    Queuing and writing run as two tasks rather than one loop. They have to: the
+    cast arrives in batches from a model, so pulling the next line can block for
+    the better part of a minute — and a single loop spends that minute holding
+    finished audio it could have been sending. That is what left a reading
+    silent for eighty seconds before its opening line, with the words for it
+    already synthesised and waiting in the queue.
     """
-    pending: deque[tuple[asyncio.Task, str, Utterance]] = deque()
+    # Bounded, so no more than MAGPIE_PREFETCH pieces are ever in flight — the
+    # backpressure that the old length check used to provide.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=MAGPIE_PREFETCH)
     spoken = 0
-    opening = True
-    previous: tuple[str, str] | None = None
-    # Counted only to report how a reading went. Whether to keep asking Magpie
-    # is the breaker's decision, and it is made per key rather than per story.
     misses = 0
 
-    async def speak_on_edge(piece: str, utterance: Utterance) -> None:
-        await _speak_fallback(piece, utterance, writer, MAGPIE_SAMPLE_RATE)
+    async def produce() -> int:
+        """Cut each line into pieces and start synthesising them, in order."""
+        count = 0
+        opening = True
 
-    async def write_next() -> None:
-        nonlocal previous, misses
-
-        task, piece, utterance = pending.popleft()
-
-        if previous is not None:
-            last_text, last_speaker = previous
-            writer(
-                silence(
-                    _pause_after(last_text, last_speaker != utterance.speaker),
-                    MAGPIE_SAMPLE_RATE,
-                )
-            )
-
-        previous = (piece, utterance.speaker)
-
-        try:
-            writer(await task)
-            misses = 0
-        except Exception as error:
-            # One piece failing must not cost the rest of the story, so it is
-            # read by the nearest edge-tts voice instead. The change is audible,
-            # which is better than a hole where the sentence should be.
-            misses += 1
-            # The reason lives on the cause: every attempt failed, and the
-            # RuntimeError raised at the end only says that it did. Logging the
-            # cause is the difference between "Magpie failed" and "the quota is
-            # gone", which are not the same problem.
-            reason = error.__cause__ or error
-            logger.warning(
-                "Magpie could not speak %d chars as %s (%s) — reading it in "
-                "edge-tts instead",
-                len(piece),
-                utterance.voice,
-                reason,
-            )
-
-            await speak_on_edge(piece, utterance)
-
-    try:
         async for utterance in cast:
             tone = _tone_of(utterance)
             speed = _speed_of(utterance)
@@ -420,8 +387,8 @@ async def _speak_magpie(
                 pieces = split_text(utterance.text)
 
             for piece in pieces:
-                # Always asked. When every key is inside its cooldown the
-                # call fails at once without spending a retry, which is what the
+                # Always asked. When every key is inside its cooldown the call
+                # fails at once without spending a retry, which is what the
                 # give-up flag used to be for — except that flag never lifted,
                 # so a handful of transient refusals sent the whole rest of the
                 # story to edge-tts and left it there. The breaker holds Magpie
@@ -429,23 +396,86 @@ async def _speak_magpie(
                 task = asyncio.ensure_future(
                     synthesize(piece, utterance.voice, tone, language, speed)
                 )
-                pending.append((task, piece, utterance))
+                await queue.put((task, piece, utterance))
 
-                # Awaiting the head is the backpressure: no more than
-                # MAGPIE_PREFETCH pieces are ever being synthesised at once.
-                while len(pending) > MAGPIE_PREFETCH:
-                    await write_next()
+            count += 1
 
-            spoken += 1
+        await queue.put(None)
 
-        while pending:
-            await write_next()
+        return count
+
+    async def consume() -> None:
+        """Write each piece the moment it is ready, in reading order."""
+        nonlocal misses
+
+        previous: tuple[str, str] | None = None
+
+        while True:
+            item = await queue.get()
+
+            if item is None:
+                return
+
+            task, piece, utterance = item
+
+            if previous is not None:
+                last_text, last_speaker = previous
+                writer(
+                    silence(
+                        _pause_after(
+                            last_text, last_speaker != utterance.speaker
+                        ),
+                        MAGPIE_SAMPLE_RATE,
+                    )
+                )
+
+            previous = (piece, utterance.speaker)
+
+            try:
+                writer(await task)
+                misses = 0
+            except Exception as error:
+                # One piece failing must not cost the rest of the story, so it
+                # is read by the nearest edge-tts voice instead. The change is
+                # audible, which is better than a hole where the sentence should
+                # be.
+                misses += 1
+                # The reason lives on the cause: every attempt failed, and the
+                # RuntimeError raised at the end only says that it did. Logging
+                # the cause is the difference between "Magpie failed" and "the
+                # quota is gone", which are not the same problem.
+                reason = error.__cause__ or error
+                logger.warning(
+                    "Magpie could not speak %d chars as %s (%s) — reading it in "
+                    "edge-tts instead",
+                    len(piece),
+                    utterance.voice,
+                    reason,
+                )
+
+                await _speak_fallback(
+                    piece, utterance, writer, MAGPIE_SAMPLE_RATE
+                )
+
+    producer = asyncio.ensure_future(produce())
+    consumer = asyncio.ensure_future(consume())
+
+    try:
+        spoken, _ = await asyncio.gather(producer, consumer)
     finally:
         # Reached when the listener navigates away mid-story, which would
         # otherwise leave paid-for requests running with nowhere to go.
-        for task, _, _ in pending:
-            if task is None:
+        for task in (producer, consumer):
+            if not task.done():
+                task.cancel()
+
+        while not queue.empty():
+            item = queue.get_nowait()
+
+            if item is None:
                 continue
+
+            task = item[0]
 
             if task.done():
                 # Retrieving the exception is what stops asyncio reporting it as

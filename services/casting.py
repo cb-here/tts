@@ -267,12 +267,13 @@ def language_of(text: str) -> str:
 NARRATOR = "narrator"
 
 # Each batch costs one round trip regardless of its size, and the reply is only
-# a line per segment, so bigger batches are nearly free. Measured: 80 segments
-# came back complete on 1,281 completion tokens against a 4,096 budget, and took
-# no longer than 30 did — the free tier's own variance dwarfs the size. Sixty
-# halves the calls a very long story needs, which is what decides whether it
-# gets cast at all.
-CAST_BATCH_SIZE = 60
+# a line per segment, so a bigger batch looks nearly free. It is not, and sixty
+# was too many: the reply has to name a speaker for every segment in it, and on
+# a slow host all five batches of a 15,000-character story timed out — every
+# dialogue line in the whole reading lost its speaker and fell to a stand-in.
+# One that answers beats two that do not, so this is sized to come back inside
+# the timeout rather than to keep the call count down.
+CAST_BATCH_SIZE = 24
 CAST_PREFETCH = 3
 CAST_CONTEXT_SEGMENTS = 3
 
@@ -477,7 +478,12 @@ async def _ask(system_prompt: str, user_content: str, subject: str) -> dict:
     body = {
         "model": NVIDIA_MODEL,
         "temperature": 0,
-        "max_tokens": 4096,
+        # Reasoning models spend this budget thinking before they answer, and
+        # what they spend is not visible in the reply. At 4,096 a batch came back
+        # with finish_reason=length and no content at all — the thinking had
+        # eaten the whole allowance, and every line in that batch lost its
+        # speaker. Headroom is far cheaper than a batch that answers nothing.
+        "max_tokens": 16384,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
