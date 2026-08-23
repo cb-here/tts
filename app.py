@@ -23,14 +23,11 @@ async def _sweeper():
         try:
             sweep()
         except Exception:
-            # A failed sweep must not kill the loop, or nothing is ever
-            # cleaned again for the life of the process.
             logger.exception("Audio sweep failed")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Anything still on disk belongs to a process that is gone.
     clear_all()
     task = asyncio.create_task(_sweeper())
 

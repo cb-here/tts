@@ -1,16 +1,5 @@
-"""Recognise a character by name when the spelling drifts.
-
-Each batch is a separate call to the model, and the same person comes back as
-"रवि" in one and "Ravi" in the next. Treated as written, that is two characters:
-two entries in the cast, two different voices, and a gender lookup that misses
-and falls through to guesswork. Folding the spellings together is what keeps one
-character sounding like one person.
-"""
-
 import re
 
-# Enough of Devanagari to romanise a name. Accuracy beyond that is wasted here —
-# the result is only ever compared against another name, never shown.
 _VOWELS = {
     "अ": "a", "आ": "aa", "इ": "i", "ई": "ii", "उ": "u", "ऊ": "uu",
     "ऋ": "ri", "ए": "e", "ऐ": "ai", "ओ": "o", "औ": "au",
@@ -34,7 +23,6 @@ _SIGNS = {"ं": "n", "ः": "h", "ँ": "n"}
 _HALANT = "्"
 _NUKTA = "़"
 
-# Titles that attach to a name in one batch and not the next.
 _HONORIFICS = {
     "जी", "साहब", "साहिब", "बाबू", "भाई", "बहन", "दीदी", "अंकल", "आंटी",
     "श्री", "श्रीमती", "पंडित", "चाचा", "चाची", "मामा", "मामी", "बुआ",
@@ -47,7 +35,6 @@ _NON_LETTER = re.compile(r"[^\wऀ-ॿ]", re.UNICODE)
 
 
 def romanise(name: str) -> str:
-    """Write a Devanagari name in Latin letters. Latin input passes through."""
     out: list[str] = []
     index = 0
 
@@ -61,7 +48,6 @@ def romanise(name: str) -> str:
         if character in _CONSONANTS:
             out.append(_CONSONANTS[character])
 
-            # A nukta sits between the consonant and whatever follows it.
             ahead = index + 1
             while ahead < len(name) and name[ahead] == _NUKTA:
                 ahead += 1
@@ -74,8 +60,6 @@ def romanise(name: str) -> str:
             elif following == _HALANT:
                 index = ahead + 1
             else:
-                # A bare consonant carries an implicit "a": र + व + ि is "ravi",
-                # not "rvi", and it is the Latin spelling it has to match.
                 out.append("a")
                 index += 1
 
@@ -93,16 +77,6 @@ def romanise(name: str) -> str:
 
 
 def match_key(name: str) -> str:
-    """A form of a name that survives how it happened to be spelled.
-
-    Reduced to consonants, because that is what the spellings agree on: Pooja
-    and पूजा romanise to "poojaa" and "puujaa", but both are p-j. A leading
-    vowel is kept, so अमन and मोनू do not collapse into each other.
-
-    Two genuinely different names can still land on one key — राम and रमा both
-    give r-m. That is the safer way round: the cost is two characters sharing a
-    voice, against one character being split across two.
-    """
     words = [
         word
         for word in _WORD_SPLIT.split(name.strip())
@@ -119,8 +93,6 @@ def match_key(name: str) -> str:
         if letter in "aeiou":
             continue
 
-        # An ad-hoc Latin spelling doubles consonants where Devanagari does not
-        # — "buddha" against बूढ़ा — so a run counts once.
         if consonants and consonants[-1] == letter:
             continue
 

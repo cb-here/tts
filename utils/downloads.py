@@ -2,11 +2,6 @@ from urllib.parse import quote
 
 
 def content_disposition(filename: str) -> str:
-    """Build an attachment header the browser will honour cross-origin.
-
-    The `download` attribute on an `<a>` is ignored for cross-origin URLs, so
-    the filename has to come from the server instead of the markup.
-    """
     cleaned = "".join(
         char
         for char in filename.strip().replace("/", "_").replace("\\", "_")

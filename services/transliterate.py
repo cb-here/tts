@@ -1,11 +1,3 @@
-"""Turn Roman-script Hindi (or messy pasted text) into clean Devanagari.
-
-The text is converted a chunk at a time. Devanagari costs roughly a token per
-character, so handing a whole story over in one request would run past the reply
-limit and come back quietly truncated — which is exactly the silent content loss
-the instructions forbid.
-"""
-
 import asyncio
 import json
 import logging
@@ -28,22 +20,12 @@ CHUNK_CHARS = 1200
 PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
 SENTENCE_BREAK = re.compile(r"(?<=[.!?।])\s+")
 
-# A reply this much shorter than its source has dropped content rather than
-# transliterated it, so the original is kept instead.
 MIN_KEPT_RATIO = 0.4
 
 _slots = asyncio.Semaphore(MAX_CONCURRENT_CASTING)
 
-# The model reliably transliterates but will not drop scan artefacts however
-# firmly it is asked, so the clearest case is handled here instead: a long run
-# of digits opening a line, which is a page number or OCR noise rather than
-# content. Eight digits is past any date, age, price or chapter number, and
-# figures embedded in a sentence are left alone.
 OCR_DIGIT_RUN = re.compile(r"^[ \t]*[\d०-९]{8,}[ \t]*", re.MULTILINE)
 
-# A scanned page leaves its furniture behind: figure and table callouts, plate
-# numbers, page markers. These only match a line that is nothing but the
-# marker, so a sentence that happens to mention a figure is untouched.
 PAGE_FURNITURE = re.compile(
     r"""^[ \t]*[\[\(]?\s*
     (?:image|img|figure|fig|photo|picture|plate|table|chart|diagram|graph|
@@ -53,7 +35,6 @@ PAGE_FURNITURE = re.compile(
     re.IGNORECASE | re.MULTILINE | re.VERBOSE,
 )
 
-# Bare markdown image or link embeds left by a converter.
 MARKDOWN_EMBED = re.compile(r"^[ \t]*!?\[[^\]]*\]\([^)]*\)[ \t]*$", re.MULTILINE)
 
 
@@ -159,11 +140,6 @@ You are given the text as numbered lines. Reply with JSON only, in exactly this 
 def split_for_conversion(
     lines: list[tuple[int, str]],
 ) -> list[list[tuple[int, str]]]:
-    """Group numbered lines into request-sized batches.
-
-    Lines are kept whole and carry their original position, so a screenplay cue
-    cannot be merged into the line above it or quietly dropped.
-    """
     chunks: list[list[tuple[int, str]]] = []
     current: list[tuple[int, str]] = []
     size = 0
@@ -183,7 +159,6 @@ def split_for_conversion(
 
 
 def _strip_wrapping(reply: str) -> str:
-    """Drop code fences the model sometimes wraps the answer in."""
     cleaned = reply.strip()
 
     if cleaned.startswith("```"):
@@ -197,12 +172,6 @@ async def _convert_chunk(
     chunk: list[tuple[int, str]],
     number: int,
 ) -> dict[int, str]:
-    """Convert one batch of numbered lines. Returns {original index: text}.
-
-    On any failure it returns nothing for that batch, and the caller keeps the
-    original lines — a conversion that silently loses a speaker cue is worse
-    than one that leaves the text alone.
-    """
     listing = "\n".join(f"[{index}] {line}" for index, line in chunk)
 
     body = {
@@ -272,8 +241,6 @@ async def _convert_chunk(
         text = str(entry.get("text") or "").strip()
         source = allowed[index]
 
-        # An empty reply means the model judged the line to be garbage, which is
-        # allowed. A drastically shortened one means it dropped content.
         if text and len(text) < len(source) * MIN_KEPT_RATIO:
             logger.warning(
                 "Line %d shrank from %d to %d characters — keeping the original",
@@ -298,7 +265,6 @@ async def _convert_chunk(
 
 
 async def to_devanagari(text: str) -> str:
-    """Convert the whole text, line for line."""
     if not casting_enabled():
         raise RuntimeError("NVIDIA_API_KEY is not set")
 
@@ -330,8 +296,6 @@ async def to_devanagari(text: str) -> str:
         len(chunks),
     )
 
-    # Rebuilt against the original line list, so blank lines and paragraph
-    # breaks survive exactly as they were.
     rebuilt = [
         converted.get(index, line.strip()) if line.strip() else ""
         for index, line in enumerate(lines)

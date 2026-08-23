@@ -4,8 +4,6 @@ from services.cache import discard
 from time import monotonic
 from uuid import uuid4
 
-# A browser cannot POST a body from `<audio src="...">`, so the request is split
-# in two: POST the text once to park it here, then GET the stream by id.
 MAX_SESSIONS = 200
 
 
@@ -16,17 +14,12 @@ class TTSSession:
     rate: str
     multi_voice: bool
     created_at: float
-    # A cast the listener settled in the reader, name → gender and name → voice.
-    # Parked with the text because the stream is fetched separately, and by then
-    # the request that carried it is long gone.
     cast_genders: dict[str, str] = field(default_factory=dict)
     cast_voices: dict[str, str] = field(default_factory=dict)
-    # Measured from the last time the stream was asked for, not from when the
-    # text was parked. A 50,000-character story is over an hour of audio, so a
-    # window counted from creation expires while it is still being read aloud —
-    # and taking the session away mid-story is what makes the player go back to
-    # the beginning.
+    cast_moods: dict[str, str] = field(default_factory=dict)
     touched_at: float = field(default=0.0)
+    marks: list[tuple[float, str]] = field(default_factory=list)
+    marks_done: bool = field(default=False)
 
 
 _sessions: dict[str, TTSSession] = {}
@@ -45,8 +38,6 @@ def _prune(now: float) -> None:
     ]:
         _forget(key)
 
-    # Hard cap as well, so a burst of traffic inside one TTL window cannot grow
-    # the dict without bound.
     while len(_sessions) > MAX_SESSIONS:
         _forget(min(_sessions, key=lambda key: _sessions[key].touched_at))
 
@@ -58,6 +49,7 @@ def create_session(
     multi_voice: bool = False,
     cast_genders: dict[str, str] | None = None,
     cast_voices: dict[str, str] | None = None,
+    cast_moods: dict[str, str] | None = None,
 ) -> str:
     now = monotonic()
     _prune(now)
@@ -72,6 +64,7 @@ def create_session(
         touched_at=now,
         cast_genders=cast_genders or {},
         cast_voices=cast_voices or {},
+        cast_moods=cast_moods or {},
     )
 
     return session_id

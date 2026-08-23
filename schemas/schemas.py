@@ -9,21 +9,14 @@ class TTSRequest(BaseModel):
 
 
 class CastMember(BaseModel):
-    """Who a character is, as decided by the listener rather than the model."""
 
     gender: Literal["male", "female", "neutral"] = "neutral"
-    # Pinned outright, overriding the pool. Left unset, the character still gets
-    # a voice of their own — just one chosen for them.
     voice: VoiceEnum | None = None
+    mood: str | None = Field(default=None, max_length=200)
 
 
 class TTSStreamRequest(TTSRequest):
-    # Beta: let an LLM split the text by speaker and cast a voice per character.
-    # `voice` stays the fallback, and is used for narration.
     multi_voice: bool = False
-    # A cast the listener settled themselves, keyed by character name. Sending
-    # it removes the one thing the model was worst at — deciding whether a
-    # character is a man or a woman — and skips the call that used to ask.
     cast: dict[str, CastMember] | None = None
 
 
@@ -38,6 +31,9 @@ class DevanagariResponse(BaseModel):
 class TTSStreamSession(BaseModel):
     session_id: str
     stream_url: str
-    # A streamed response has no length, so the player has nothing to scale its
-    # progress bar against until the whole reading has arrived.
     estimated_seconds: float
+
+
+class SpokenMarks(BaseModel):
+    marks: list[tuple[float, str]]
+    done: bool

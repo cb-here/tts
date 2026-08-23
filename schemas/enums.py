@@ -1,16 +1,10 @@
 from enum import StrEnum
 
 
-# StrEnum rather than (str, Enum): the two behave identically everywhere that
-# matters, but str() on the older form gives "VoiceEnum.magpie_mia" instead of
-# the voice itself, which is what every log line about a voice then reported.
 class VoiceEnum(StrEnum):
-    # Microsoft ships only these two for hi-IN.
     swara = "hi-IN-SwaraNeural"
     madhur = "hi-IN-MadhurNeural"
 
-    # Multilingual voices: a newer, more expressive model that speaks Hindi as
-    # well, which is the only way past the two voices above.
     emma = "en-US-EmmaMultilingualNeural"
     vivienne = "fr-FR-VivienneMultilingualNeural"
     thalita = "pt-BR-ThalitaMultilingualNeural"
@@ -22,24 +16,26 @@ class VoiceEnum(StrEnum):
     aria = "en-US-AriaNeural"
     guy = "en-US-GuyNeural"
 
-    # NVIDIA Magpie. A different engine entirely — warmer and far less flat than
-    # edge-tts. Picking one of these switches the whole reading, cast included.
-    #
-    # The locale in each name labels the speaker, not what they can read: every
-    # one of them speaks Hindi and English alike, because the language is sent
-    # separately from the voice. That is thirteen distinct people, where
-    # edge-tts fields nine.
-    magpie_mia = "Magpie-Multilingual.EN-US.Mia"
-    magpie_aria = "Magpie-Multilingual.EN-US.Aria"
-    magpie_sofia = "Magpie-Multilingual.EN-US.Sofia"
-    magpie_isabela = "Magpie-Multilingual.ES-US.Isabela"
-    magpie_siwei = "Magpie-Multilingual.HI-IN.Siwei"
-    magpie_louise = "Magpie-Multilingual.FR-FR.Louise"
+    achernar = "hi-IN-Chirp3-HD-Achernar"
+    kore = "hi-IN-Chirp3-HD-Kore"
+    leda = "hi-IN-Chirp3-HD-Leda"
+    aoede = "hi-IN-Chirp3-HD-Aoede"
+    despina = "hi-IN-Chirp3-HD-Despina"
 
-    magpie_jason = "Magpie-Multilingual.EN-US.Jason"
-    magpie_leo = "Magpie-Multilingual.EN-US.Leo"
-    magpie_ray = "Magpie-Multilingual.EN-US.Ray"
-    magpie_diego = "Magpie-Multilingual.ES-US.Diego"
-    magpie_pascal = "Magpie-Multilingual.FR-FR.Pascal"
-    magpie_long = "Magpie-Multilingual.VI-VN.Long.Neutral"
-    magpie_houzhen = "Magpie-Multilingual.ZH-CN.HouZhen"
+    algenib = "hi-IN-Chirp3-HD-Algenib"
+    charon = "hi-IN-Chirp3-HD-Charon"
+    puck = "hi-IN-Chirp3-HD-Puck"
+    orus = "hi-IN-Chirp3-HD-Orus"
+    fenrir = "hi-IN-Chirp3-HD-Fenrir"
+
+    gemini_kore = "gemini/Kore"
+    gemini_leda = "gemini/Leda"
+    gemini_aoede = "gemini/Aoede"
+    gemini_despina = "gemini/Despina"
+    gemini_zephyr = "gemini/Zephyr"
+
+    gemini_puck = "gemini/Puck"
+    gemini_charon = "gemini/Charon"
+    gemini_orus = "gemini/Orus"
+    gemini_fenrir = "gemini/Fenrir"
+    gemini_algenib = "gemini/Algenib"

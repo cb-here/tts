@@ -1,21 +1,18 @@
 import asyncio
 import logging
-from collections import deque
 from collections.abc import AsyncIterator
 from config import (
-    MAGPIE_OPENING_CHARS,
-    MAGPIE_PREFETCH,
-    MAGPIE_SAMPLE_RATE,
+    EDGE_BOUNDARY,
     MAX_CONCURRENT_TTS,
     PAUSE_CLAUSE_SECONDS,
     PAUSE_DEFAULT_SECONDS,
     PAUSE_SENTENCE_SECONDS,
     PAUSE_SPEAKER_SECONDS,
-    magpie_enabled,
 )
 from io import BytesIO
 from langgraph.config import get_stream_writer
 from langgraph.graph import START, StateGraph, END
+from dataclasses import dataclass
 from typing import TypedDict
 from edge_tts import Communicate
 from mutagen.id3 import ID3, USLT
@@ -27,9 +24,15 @@ from services.casting import (
     merge_stream,
     speakable,
 )
-from services.audio import silence
-from services.magpie import is_magpie, split_text, synthesize
-from services import magpie
+from services.audio import MP3_BITRATE, silence
+from services.google_tts import (
+    GOOGLE_BITRATE,
+    chirp_equivalent,
+    is_gemini_voice,
+    is_google_voice,
+    is_rate_limited,
+    speak as google_speak,
+)
 from uuid import uuid4
 from pathlib import Path
 
@@ -38,8 +41,6 @@ logger = logging.getLogger(__name__)
 AUDIO_DIR = Path("audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 
-# Held per utterance rather than per request: a listener is mid-story for
-# minutes, so locking for a whole stream would stall everyone behind them.
 _tts_slots = asyncio.Semaphore(MAX_CONCURRENT_TTS)
 
 class TTSState(TypedDict):
@@ -48,36 +49,35 @@ class TTSState(TypedDict):
     voice: str
     rate: str
     multi_voice: bool
-    # Who the listener said each character is, and any voice they pinned. Empty
-    # when the reader was never opened on the cast, in which case the casting
-    # model works it out as before.
     cast_genders: dict[str, str]
     cast_voices: dict[str, str]
+    cast_moods: dict[str, str]
 
 
-# Measured against edge-tts Hindi output at +0%: 5407 chars produced 497s and
-# 13480 chars produced 1168s, both about 0.088s per character.
 SECONDS_PER_CHAR = 0.088
+GOOGLE_SECONDS_PER_CHAR = 0.069
 
-# Magpie takes no pitch argument, so a character's pitch offset is applied by
-# resampling instead. This converts one to the other: +22Hz reads about 4%
-# faster and higher, which is roughly what edge-tts does with the same number.
-HZ_PER_TONE = 500.0
-
-# edge-tts answers with audio-24khz-48kbitrate-mono-mp3. The silence spliced
-# between its pieces has to be cut at the same rate, or players stumble over the
-# sample rate changing mid-file.
 EDGE_SAMPLE_RATE = 24000
+
+EDGE_BITRATE = 48000
+SILENCE_BITRATE = MP3_BITRATE * 1000
+
+
+@dataclass(frozen=True)
+class Mark:
+    at: float
+    text: str
+
+
+def _seconds(size: int, bitrate: int) -> float:
+    return size * 8 / bitrate
 
 SENTENCE_END = ("।", ".", "!", "?", "…")
 CLAUSE_END = (",", ";", ":", "—", "–")
-# Quotation marks are stripped from dialogue already, but a piece cut out of the
-# middle of a speech can still end on one.
 TRAILING_MARKS = "\"'”’»›」"
 
 
 def _pause_after(text: str, speaker_changes: bool) -> float:
-    """How long to hold before the next piece, read off the end of this one."""
     ended = text.rstrip().rstrip(TRAILING_MARKS).rstrip()
 
     if ended.endswith(SENTENCE_END):
@@ -87,7 +87,6 @@ def _pause_after(text: str, speaker_changes: bool) -> float:
     else:
         gap = PAUSE_DEFAULT_SECONDS
 
-    # Someone else answering is a beat in its own right, even mid-sentence.
     return max(gap, PAUSE_SPEAKER_SECONDS) if speaker_changes else gap
 
 
@@ -98,47 +97,15 @@ def _percent(rate: str) -> float:
         return 0.0
 
 
-def _tone_of(utterance: Utterance) -> float:
-    """How far to shift the voice itself, to tell this character from the rest."""
-    try:
-        hertz = int(utterance.pitch.strip().rstrip("Hz"))
-    except (AttributeError, ValueError):
-        hertz = 0
-
-    return 1 + hertz / HZ_PER_TONE
-
-
-def _speed_of(utterance: Utterance) -> float:
-    """How fast to read, with the voice left where it is.
-
-    Kept apart from the tone above because they are not the same request. Folded
-    together, asking for a slower story also asked for a deeper narrator.
-    """
-    return 1 + _percent(utterance.rate)
-
-
 def estimate_duration(text: str, rate: str, voice: str = "") -> float:
-    """Roughly how long this will take to read aloud.
-
-    A streamed response has no length, so the browser reports an infinite
-    duration and its progress bar has nothing to scale against. This gives the
-    player something honest to draw until the real duration is known.
-    """
-    seconds_per_char = (
-        magpie.SECONDS_PER_CHAR if is_magpie(voice) else SECONDS_PER_CHAR
+    per_char = (
+        GOOGLE_SECONDS_PER_CHAR if is_google_voice(voice) else SECONDS_PER_CHAR
     )
 
-    # "+50%" means half again as fast, so the reading is correspondingly shorter.
-    return len(text) * seconds_per_char / (1 + _percent(rate))
+    return len(text) * per_char / (1 + _percent(rate))
 
 
 def build_lyrics_tag(text: str) -> bytes:
-    """Render the ID3 lyrics tag on its own, without touching a file.
-
-    An ID3v2 tag lives at the *front* of an mp3, so it can be emitted before a
-    single audio byte exists. That is what lets the whole pipeline stream: the
-    lyrics go out first, then audio flows in behind them.
-    """
     buffer = BytesIO()
 
     tag = ID3()
@@ -164,29 +131,25 @@ def embed_text(state: TTSState):
     }
 
 
-# edge-tts occasionally closes a connection having sent nothing, on text it
-# reads perfectly well a second later — the same short lines were confirmed to
-# succeed three times out of three on their own. Since this path is already the
-# fallback, one more attempt is the difference between a lost line and a
-# recovered one.
 EDGE_RETRIES = 1
 EDGE_RETRY_SECONDS = 0.5
 
-# Multilingual, so it reads Devanagari and Latin alike. The last thing tried
-# before a line is given up on.
 LAST_RESORT_VOICE = "en-US-EmmaMultilingualNeural"
 
 
-async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
-    """Speak one piece with edge-tts and hand back the whole thing at once."""
+async def _edge_bytes(
+    text: str, utterance: Utterance, voice: str
+) -> tuple[bytes, list[tuple[float, str]]]:
     for attempt in range(EDGE_RETRIES + 1):
         audio = bytearray()
+        boundaries: list[tuple[float, str]] = []
 
         communicate = Communicate(
             text=text,
             voice=voice,
             rate=utterance.rate,
             pitch=utterance.pitch,
+            boundary=EDGE_BOUNDARY,
         )
 
         try:
@@ -194,6 +157,8 @@ async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
                         audio += chunk["data"]
+                    elif chunk["type"] == EDGE_BOUNDARY:
+                        boundaries.append((chunk["offset"] / 1e7, chunk["text"]))
         except Exception:
             if attempt == EDGE_RETRIES:
                 raise
@@ -202,10 +167,8 @@ async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
             continue
 
         if audio:
-            return bytes(audio)
+            return bytes(audio), boundaries
 
-        # A clean connection that carried no audio is the same failure wearing
-        # a different hat, and would otherwise be published as a silent line.
         if attempt == EDGE_RETRIES:
             raise RuntimeError(f"edge-tts returned no audio for {len(text)} characters")
 
@@ -214,33 +177,24 @@ async def _edge_bytes(text: str, utterance: Utterance, voice: str) -> bytes:
     raise RuntimeError(f"edge-tts returned no audio for {len(text)} characters")
 
 
-# Both stand-ins are the same service. When edge-tts starts refusing, neither
-# answers — and the ladder as it stood conceded after about two seconds, wrote a
-# beat of silence, and moved on. Once Magpie has been given up on, every piece
-# left in the story arrives here, so that concession is not one lost sentence:
-# it is the rest of the reading turning silent, which is exactly what a listener
-# sees ten minutes into a long story.
-#
-# Waiting costs a pause the browser's buffer absorbs. Conceding costs the story.
 FALLBACK_ROUNDS = 4
 FALLBACK_BACKOFF_SECONDS = 3.0
 MAX_FALLBACK_BACKOFF_SECONDS = 20.0
 
 
 async def _speak_fallback(
-    piece: str, utterance: Utterance, writer, rate: int
-) -> None:
-    """Get this piece spoken by something, or say plainly that it was lost.
-
-    The mapped stand-in first, then a voice known to read anything, and then the
-    pair again after a wait — a throttled service is refusing for now rather than
-    for good, and it is worth outlasting.
-    """
+    piece: str, utterance: Utterance, writer, rate: int, started: float
+) -> float:
     for attempt in range(FALLBACK_ROUNDS):
         for voice in (edge_equivalent(utterance.voice), LAST_RESORT_VOICE):
             try:
-                writer(await _edge_bytes(piece, utterance, voice))
-                return
+                audio, boundaries = await _edge_bytes(piece, utterance, voice)
+                writer(audio)
+
+                for at, text in boundaries:
+                    writer(Mark(at=started + at, text=text))
+
+                return _seconds(len(audio), EDGE_BITRATE)
             except Exception as error:
                 logger.warning(
                     "%s could not speak %d chars (%s: %s)",
@@ -265,224 +219,143 @@ async def _speak_fallback(
             )
             await asyncio.sleep(wait)
 
-    # Holding the beat keeps the reading moving instead of tearing the
-    # connection down, but part of the story is genuinely gone — not a warning.
     logger.error(
         "Dropped %d characters of the story — no voice would speak them: %r",
         len(piece),
         piece[:120],
     )
-    writer(silence(PAUSE_SENTENCE_SECONDS, rate))
+
+    gap = silence(PAUSE_SENTENCE_SECONDS, rate)
+    writer(gap)
+
+    return _seconds(len(gap), SILENCE_BITRATE)
 
 
 async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
-    """Stream each utterance as edge-tts produces it."""
     spoken = 0
     previous: Utterance | None = None
+    elapsed = 0.0
 
     async for utterance in cast:
         if previous is not None:
-            writer(
-                silence(
-                    _pause_after(previous.text, previous.speaker != utterance.speaker),
-                    EDGE_SAMPLE_RATE,
-                )
+            gap = silence(
+                _pause_after(previous.text, previous.speaker != utterance.speaker),
+                EDGE_SAMPLE_RATE,
             )
+            writer(gap)
+            elapsed += _seconds(len(gap), SILENCE_BITRATE)
 
         previous = utterance
-
-        communicate = Communicate(
-            text=utterance.text,
-            voice=utterance.voice,
-            rate=utterance.rate,
-            pitch=utterance.pitch,
-        )
+        started = elapsed
 
         carried = 0
+        bitrate = EDGE_BITRATE
+        marks: list[Mark] = []
 
-        try:
-            async with _tts_slots:
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        writer(chunk["data"])
-                        carried += len(chunk["data"])
-        except Exception as error:
-            # Only safe to retry while nothing has gone out yet; past that the
-            # listener would hear the first half of the line twice.
-            if carried:
-                raise
+        if is_google_voice(utterance.voice):
+            bitrate = GOOGLE_BITRATE
 
-            logger.warning(
-                "%s failed part-way through %d chars (%s: %s)",
-                utterance.voice,
-                len(utterance.text),
-                type(error).__name__,
-                error,
+            try:
+                async with _tts_slots:
+                    audio = await google_speak(
+                        utterance.text,
+                        utterance.voice,
+                        utterance.rate,
+                        utterance.pitch,
+                        utterance.mood,
+                    )
+
+                writer(audio)
+                carried = len(audio)
+            except Exception as error:
+                stand_in = chirp_equivalent(utterance.voice)
+
+                if is_gemini_voice(utterance.voice) and is_rate_limited(error):
+                    logger.info(
+                        "%s is out of requests for now — %s reads these %d chars "
+                        "instead, without the direction",
+                        utterance.voice,
+                        stand_in,
+                        len(utterance.text),
+                    )
+                else:
+                    logger.warning(
+                        "%s could not speak %d chars (%s: %s)",
+                        utterance.voice,
+                        len(utterance.text),
+                        type(error).__name__,
+                        error,
+                    )
+
+                if is_gemini_voice(utterance.voice):
+                    try:
+                        async with _tts_slots:
+                            audio = await google_speak(
+                                utterance.text,
+                                stand_in,
+                                utterance.rate,
+                                utterance.pitch,
+                            )
+
+                        writer(audio)
+                        carried = len(audio)
+                    except Exception as second:
+                        logger.warning(
+                            "%s could not stand in either (%s: %s)",
+                            stand_in,
+                            type(second).__name__,
+                            second,
+                        )
+        else:
+            communicate = Communicate(
+                text=utterance.text,
+                voice=utterance.voice,
+                rate=utterance.rate,
+                pitch=utterance.pitch,
+                boundary=EDGE_BOUNDARY,
             )
 
-        if not carried:
-            # An utterance that produced nothing at all used to pass silently,
-            # and a merged run of narration is several sentences long — which is
-            # how five sentences at a time went missing from a story with
-            # nothing in the log to show it.
+            try:
+                async with _tts_slots:
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            writer(chunk["data"])
+                            carried += len(chunk["data"])
+                        elif chunk["type"] == EDGE_BOUNDARY:
+                            marks.append(
+                                Mark(
+                                    at=started + chunk["offset"] / 1e7,
+                                    text=chunk["text"],
+                                )
+                            )
+            except Exception as error:
+                if carried:
+                    raise
+
+                logger.warning(
+                    "%s failed part-way through %d chars (%s: %s)",
+                    utterance.voice,
+                    len(utterance.text),
+                    type(error).__name__,
+                    error,
+                )
+
+        if carried:
+            for mark in marks:
+                writer(mark)
+
+            elapsed = started + _seconds(carried, bitrate)
+        else:
             logger.warning(
                 "%s returned no audio for %d chars — trying again",
                 utterance.voice,
                 len(utterance.text),
             )
-            await _speak_fallback(utterance.text, utterance, writer, EDGE_SAMPLE_RATE)
+            elapsed = started + await _speak_fallback(
+                utterance.text, utterance, writer, EDGE_SAMPLE_RATE, started
+            )
 
         spoken += 1
-
-    return spoken
-
-
-# Magpie needs to be told what it is reading, and the voice cannot say — every
-# speaker reads every language, whatever locale its name carries.
-MAGPIE_LOCALES = {"hi": "hi-IN", "en": "en-US"}
-
-
-async def _speak_magpie(
-    cast: AsyncIterator[Utterance], writer, language: str
-) -> int:
-    """Synthesise ahead of the playhead, writing the pieces out in order.
-
-    Magpie returns a finished WAV rather than a stream, so a piece being spoken
-    would otherwise be the only work in flight and the listener would hear the
-    gap before every one. Several are requested at once instead, while the
-    output stays strictly in reading order.
-
-    Queuing and writing run as two tasks rather than one loop. They have to: the
-    cast arrives in batches from a model, so pulling the next line can block for
-    the better part of a minute — and a single loop spends that minute holding
-    finished audio it could have been sending. That is what left a reading
-    silent for eighty seconds before its opening line, with the words for it
-    already synthesised and waiting in the queue.
-    """
-    # Bounded, so no more than MAGPIE_PREFETCH pieces are ever in flight — the
-    # backpressure that the old length check used to provide.
-    queue: asyncio.Queue = asyncio.Queue(maxsize=MAGPIE_PREFETCH)
-    spoken = 0
-    misses = 0
-
-    async def produce() -> int:
-        """Cut each line into pieces and start synthesising them, in order."""
-        count = 0
-        opening = True
-
-        async for utterance in cast:
-            tone = _tone_of(utterance)
-            speed = _speed_of(utterance)
-
-            if opening:
-                pieces = split_text(utterance.text, MAGPIE_OPENING_CHARS)
-
-                if len(pieces) > 1:
-                    # Only the opening is shortened. Splitting the whole reading
-                    # this finely would multiply the round trips for nothing.
-                    pieces = pieces[:1] + split_text(" ".join(pieces[1:]))
-
-                opening = False
-            else:
-                pieces = split_text(utterance.text)
-
-            for piece in pieces:
-                # Always asked. When every key is inside its cooldown the call
-                # fails at once without spending a retry, which is what the
-                # give-up flag used to be for — except that flag never lifted,
-                # so a handful of transient refusals sent the whole rest of the
-                # story to edge-tts and left it there. The breaker holds Magpie
-                # back for a minute and then lets the reading have it again.
-                task = asyncio.ensure_future(
-                    synthesize(piece, utterance.voice, tone, language, speed)
-                )
-                await queue.put((task, piece, utterance))
-
-            count += 1
-
-        await queue.put(None)
-
-        return count
-
-    async def consume() -> None:
-        """Write each piece the moment it is ready, in reading order."""
-        nonlocal misses
-
-        previous: tuple[str, str] | None = None
-
-        while True:
-            item = await queue.get()
-
-            if item is None:
-                return
-
-            task, piece, utterance = item
-
-            if previous is not None:
-                last_text, last_speaker = previous
-                writer(
-                    silence(
-                        _pause_after(
-                            last_text, last_speaker != utterance.speaker
-                        ),
-                        MAGPIE_SAMPLE_RATE,
-                    )
-                )
-
-            previous = (piece, utterance.speaker)
-
-            try:
-                writer(await task)
-                misses = 0
-            except Exception as error:
-                # One piece failing must not cost the rest of the story, so it
-                # is read by the nearest edge-tts voice instead. The change is
-                # audible, which is better than a hole where the sentence should
-                # be.
-                misses += 1
-                # The reason lives on the cause: every attempt failed, and the
-                # RuntimeError raised at the end only says that it did. Logging
-                # the cause is the difference between "Magpie failed" and "the
-                # quota is gone", which are not the same problem.
-                reason = error.__cause__ or error
-                logger.warning(
-                    "Magpie could not speak %d chars as %s (%s) — reading it in "
-                    "edge-tts instead",
-                    len(piece),
-                    utterance.voice,
-                    reason,
-                )
-
-                await _speak_fallback(
-                    piece, utterance, writer, MAGPIE_SAMPLE_RATE
-                )
-
-    producer = asyncio.ensure_future(produce())
-    consumer = asyncio.ensure_future(consume())
-
-    try:
-        spoken, _ = await asyncio.gather(producer, consumer)
-    finally:
-        # Reached when the listener navigates away mid-story, which would
-        # otherwise leave paid-for requests running with nowhere to go.
-        for task in (producer, consumer):
-            if not task.done():
-                task.cancel()
-
-        while not queue.empty():
-            item = queue.get_nowait()
-
-            if item is None:
-                continue
-
-            task = item[0]
-
-            if task.done():
-                # Retrieving the exception is what stops asyncio reporting it as
-                # never retrieved once the task is garbage collected.
-                task.exception()
-            else:
-                task.cancel()
 
     return spoken
 
@@ -495,18 +368,6 @@ async def generate_audio(state: TTSState):
 
     voice = speakable(voice, language)
 
-    if is_magpie(voice) and not magpie_enabled():
-        # Deciding this once is the difference between a reading that starts
-        # normally and one where every single piece is requested, refused, and
-        # then re-spoken by the stand-in.
-        stand_in = edge_equivalent(voice)
-        logger.warning(
-            "No key for the Magpie voices, so %s is unavailable — reading in %s",
-            voice,
-            stand_in,
-        )
-        voice = stand_in
-
     cast = merge_stream(
         iter_cast(
             text=state["text"],
@@ -515,24 +376,15 @@ async def generate_audio(state: TTSState):
             multi_voice=state.get("multi_voice", False),
             cast_genders=state.get("cast_genders") or None,
             cast_voices=state.get("cast_voices") or None,
+            cast_moods=state.get("cast_moods") or None,
         )
     )
 
-    # Each piece is its own mp3, and mp3 frames concatenate cleanly, so the
-    # speakers stitch into one continuous track. The narrator's voice decides
-    # the engine for the whole reading; the cast is drawn from the matching
-    # pool, so the two are never spliced together.
-    if is_magpie(voice):
-        spoken = await _speak_magpie(
-            cast, writer, MAGPIE_LOCALES.get(language, "en-US")
-        )
-    else:
-        spoken = await _speak_edge(cast, writer)
+    spoken = await _speak_edge(cast, writer)
 
     return {
         "status": f"Done ({spoken} utterance{'' if spoken == 1 else 's'})"
     }
-
 
 
 graph = StateGraph(TTSState)
@@ -554,12 +406,8 @@ async def stream_tts(
     multi_voice: bool = False,
     cast_genders: dict[str, str] | None = None,
     cast_voices: dict[str, str] | None = None,
-) -> AsyncIterator[bytes]:
-    """Yield mp3 bytes as edge-tts produces them.
-
-    `stream_mode="custom"` surfaces whatever the nodes hand to their stream
-    writer, so each chunk here is raw audio rather than a state update.
-    """
+    cast_moods: dict[str, str] | None = None,
+) -> AsyncIterator[bytes | Mark]:
     async for chunk in workflow.astream(
         {
             "text": text,
@@ -568,6 +416,7 @@ async def stream_tts(
             "multi_voice": multi_voice,
             "cast_genders": cast_genders or {},
             "cast_voices": cast_voices or {},
+            "cast_moods": cast_moods or {},
         },
         stream_mode="custom",
     ):
@@ -580,11 +429,11 @@ async def render_to_file(
     rate: str,
     multi_voice: bool = False,
 ) -> Path:
-    """Drain the stream into a complete mp3 on disk."""
     filename = AUDIO_DIR / f"{uuid4()}.mp3"
 
     with filename.open("wb") as audio_file:
         async for chunk in stream_tts(text, voice, rate, multi_voice):
-            audio_file.write(chunk)
+            if isinstance(chunk, bytes):
+                audio_file.write(chunk)
 
     return filename
