@@ -96,6 +96,8 @@ async def stream(
 
     if finished.exists():
         touch(finished)
+        session.marks_done = True
+
         return FileResponse(finished, media_type="audio/mpeg", headers=headers)
 
     scratch = reserve(session_id)
@@ -159,5 +161,5 @@ async def marks(session_id: str, after: int = 0):
 
     return SpokenMarks(
         marks=session.marks[max(after, 0):],
-        done=session.marks_done,
+        done=session.marks_done or cached_file(session_id).exists(),
     )
