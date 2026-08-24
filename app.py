@@ -4,6 +4,7 @@ from routes.text import router as text_route
 from routes.tts import router as tts_route
 from fastapi.middleware.cors import CORSMiddleware
 from config import AUDIO_SWEEP_SECONDS, CORS_ORIGINS, LOG_LEVEL
+from routes.tts import stop_renders
 from services.cache import clear_all, sweep
 import asyncio
 import logging
@@ -35,6 +36,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
+        await stop_renders()
         clear_all()
 
 

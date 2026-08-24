@@ -12,12 +12,105 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from utils.delete_file import delete_file
 from utils.downloads import content_disposition
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/audio", tags=["Audio"])
+
+FOLLOW_POLL_SECONDS = 0.15
+
+
+class Render:
+    def __init__(self, scratch):
+        self.scratch = scratch
+        self.done = asyncio.Event()
+        self.task: asyncio.Task | None = None
+
+
+_renders: dict[str, Render] = {}
+
+
+async def _render(session_id: str, session, render: Render) -> None:
+    complete = False
+
+    try:
+        with render.scratch.open("wb", buffering=0) as handle:
+            async for chunk in stream_tts(
+                text=session.text,
+                voice=session.voice,
+                rate=session.rate,
+                multi_voice=session.multi_voice,
+                cast_genders=session.cast_genders,
+                cast_voices=session.cast_voices,
+                cast_moods=session.cast_moods,
+            ):
+                if isinstance(chunk, Mark):
+                    session.marks.append((chunk.at, chunk.text))
+                    continue
+
+                handle.write(chunk)
+
+        complete = True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Reading %s aloud failed", session_id)
+    finally:
+        session.marks_done = complete
+
+        if complete:
+            publish(render.scratch, session_id)
+        else:
+            render.scratch.unlink(missing_ok=True)
+
+        _renders.pop(session_id, None)
+        render.done.set()
+
+
+async def stop_renders() -> None:
+    running = [
+        render.task for render in _renders.values() if render.task is not None
+    ]
+
+    for task in running:
+        task.cancel()
+
+    for task in running:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    _renders.clear()
+
+
+async def _follow(session_id: str, render: Render):
+    position = 0
+
+    while True:
+        data = b""
+
+        for path in (render.scratch, cached_file(session_id)):
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(position)
+                    data = handle.read()
+                break
+            except FileNotFoundError:
+                continue
+
+        if data:
+            position += len(data)
+            yield data
+            continue
+
+        if render.done.is_set():
+            return
+
+        await asyncio.sleep(FOLLOW_POLL_SECONDS)
 
 
 @router.post("/generate")
@@ -100,50 +193,29 @@ async def stream(
 
         return FileResponse(finished, media_type="audio/mpeg", headers=headers)
 
-    scratch = reserve(session_id)
+    render = _renders.get(session_id)
 
-    session.marks = []
-    session.marks_done = False
+    if render is None:
+        render = Render(reserve(session_id))
+        _renders[session_id] = render
 
-    async def audio_chunks():
-        complete = False
+        session.marks = []
+        session.marks_done = False
 
-        try:
-            with scratch.open("wb") as handle:
-                async for chunk in stream_tts(
-                    text=session.text,
-                    voice=session.voice,
-                    rate=session.rate,
-                    multi_voice=session.multi_voice,
-                    cast_genders=session.cast_genders,
-                    cast_voices=session.cast_voices,
-                    cast_moods=session.cast_moods,
-                ):
-                    if isinstance(chunk, Mark):
-                        session.marks.append((chunk.at, chunk.text))
-                        continue
-
-                    handle.write(chunk)
-                    yield chunk
-
-            complete = True
-        except Exception:
-            logger.exception("Audio streaming failed for session %s", session_id)
-            raise
-        finally:
-            session.marks_done = complete
-
-            if complete:
-                publish(scratch, session_id)
-            else:
-                scratch.unlink(missing_ok=True)
+        render.task = asyncio.create_task(_render(session_id, session, render))
+    else:
+        logger.info(
+            "Session %s is already being read aloud — following that instead of "
+            "reading the whole story again",
+            session_id,
+        )
 
     headers["Accept-Ranges"] = "none"
 
     headers["X-Accel-Buffering"] = "no"
 
     return StreamingResponse(
-        audio_chunks(),
+        _follow(session_id, render),
         media_type="audio/mpeg",
         headers=headers,
     )
