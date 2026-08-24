@@ -5,9 +5,9 @@ import lameenc
 MP3_BITRATE = 64
 
 
-def encode_mp3(pcm: bytes, rate: int) -> bytes:
+def encode_mp3(pcm: bytes, rate: int, bitrate: int = MP3_BITRATE) -> bytes:
     encoder = lameenc.Encoder()
-    encoder.set_bit_rate(MP3_BITRATE)
+    encoder.set_bit_rate(bitrate)
     encoder.set_in_sample_rate(rate)
     encoder.set_out_sample_rate(rate)
     encoder.set_channels(1)
@@ -18,8 +18,8 @@ def encode_mp3(pcm: bytes, rate: int) -> bytes:
 
 
 @lru_cache(maxsize=64)
-def silence(seconds: float, rate: int) -> bytes:
+def silence(seconds: float, rate: int, bitrate: int = MP3_BITRATE) -> bytes:
     if seconds <= 0:
         return b""
 
-    return encode_mp3(bytes(int(rate * seconds) * 2), rate)
+    return encode_mp3(bytes(int(rate * seconds) * 2), rate, bitrate)

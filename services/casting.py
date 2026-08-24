@@ -189,7 +189,7 @@ NARRATOR = "narrator"
 
 CAST_BATCH_SIZE = 24
 CAST_PREFETCH = 3
-CAST_CONTEXT_SEGMENTS = 3
+CAST_CONTEXT_SEGMENTS = 24
 
 MERGE_MAX_CHARS = 400
 
@@ -801,6 +801,24 @@ def single_voice(text: str, voice: str, rate: str) -> list[Utterance]:
     ]
 
 
+def _lead_in(
+    segments: list[Segment], start: int, stated: dict[int, str]
+) -> list[str]:
+    lines = []
+
+    for index in range(max(0, start - CAST_CONTEXT_SEGMENTS), start):
+        segment = segments[index]
+        excerpt = segment.text[:160]
+
+        if segment.is_dialogue:
+            excerpt = f'"{excerpt}"'
+
+        speaker = stated.get(index)
+        lines.append(f"{excerpt} — {speaker}" if speaker else excerpt)
+
+    return lines
+
+
 def _context_lines(segments: list[Segment], utterances: list[Utterance]) -> list[str]:
     lines = []
 
@@ -1064,12 +1082,16 @@ async def iter_cast(
     inflight: deque = deque()
 
     def request(position: int) -> None:
+        start = position * CAST_BATCH_SIZE
+
         inflight.append(
             asyncio.ensure_future(
                 label_segments(
                     batches[position],
                     context=(
-                        _context_lines(lead, lead_utterances) if position == 0 else None
+                        _context_lines(lead, lead_utterances)
+                        if position == 0
+                        else _lead_in(remainder, start, stated)
                     ),
                     known_characters=sorted(
                         set(assigner.cast) | set(assigner.known_genders)
@@ -1087,6 +1109,30 @@ async def iter_cast(
             try:
                 labels = await inflight.popleft()
             except Exception as error:
+                slow = isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException))
+
+                if slow:
+                    logger.warning(
+                        "Casting batch %d/%d timed out — its %d dialogue line(s) "
+                        "fall back to stand-in voices rather than waiting again",
+                        position + 1,
+                        len(batches),
+                        sum(segment.is_dialogue for segment in batch),
+                    )
+                    labels = {}
+                    queued = position + len(inflight) + 1
+                    if queued < len(batches):
+                        request(queued)
+
+                    offset = position * CAST_BATCH_SIZE
+                    take_turns(batch, labels, stated, offset)
+                    fill_gaps(batch, labels)
+
+                    for utterance in assigner.assign(batch, labels):
+                        yield utterance
+
+                    continue
+
                 logger.warning(
                     "Casting batch %d/%d failed (%s: %s) — asking once more",
                     position + 1,

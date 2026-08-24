@@ -63,6 +63,10 @@ EDGE_BITRATE = 48000
 SILENCE_BITRATE = MP3_BITRATE * 1000
 
 
+def _kbps(bitrate: int) -> int:
+    return bitrate // 1000
+
+
 @dataclass(frozen=True)
 class Mark:
     at: float
@@ -177,13 +181,34 @@ async def _edge_bytes(
     raise RuntimeError(f"edge-tts returned no audio for {len(text)} characters")
 
 
+MIN_MARK_COVERAGE = 0.70
+
+
+def _covered(marks: list[Mark], text: str) -> bool:
+    if not marks:
+        return True
+
+    spoken = sum(len(mark.text) for mark in marks)
+    letters = sum(1 for ch in text if not ch.isspace())
+
+    if letters < 20:
+        return True
+
+    return spoken >= letters * MIN_MARK_COVERAGE
+
+
 FALLBACK_ROUNDS = 4
 FALLBACK_BACKOFF_SECONDS = 3.0
 MAX_FALLBACK_BACKOFF_SECONDS = 20.0
 
 
 async def _speak_fallback(
-    piece: str, utterance: Utterance, writer, rate: int, started: float
+    piece: str,
+    utterance: Utterance,
+    writer,
+    rate: int,
+    started: float,
+    bitrate: int = EDGE_BITRATE,
 ) -> float:
     for attempt in range(FALLBACK_ROUNDS):
         for voice in (edge_equivalent(utterance.voice), LAST_RESORT_VOICE):
@@ -225,15 +250,16 @@ async def _speak_fallback(
         piece[:120],
     )
 
-    gap = silence(PAUSE_SENTENCE_SECONDS, rate)
+    gap = silence(PAUSE_SENTENCE_SECONDS, rate, _kbps(bitrate))
     writer(gap)
 
-    return _seconds(len(gap), SILENCE_BITRATE)
+    return _seconds(len(gap), bitrate)
 
 
 async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
     spoken = 0
     previous: Utterance | None = None
+    previous_bitrate = EDGE_BITRATE
     elapsed = 0.0
 
     async for utterance in cast:
@@ -241,9 +267,10 @@ async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
             gap = silence(
                 _pause_after(previous.text, previous.speaker != utterance.speaker),
                 EDGE_SAMPLE_RATE,
+                _kbps(previous_bitrate),
             )
             writer(gap)
-            elapsed += _seconds(len(gap), SILENCE_BITRATE)
+            elapsed += _seconds(len(gap), previous_bitrate)
 
         previous = utterance
         started = elapsed
@@ -340,6 +367,17 @@ async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
                     error,
                 )
 
+        if carried and not _covered(marks, utterance.text):
+            logger.warning(
+                "%s stopped part-way through %d chars (only %d words came back) "
+                "— reading it again",
+                utterance.voice,
+                len(utterance.text),
+                len(marks),
+            )
+            carried = 0
+            marks = []
+
         if carried:
             for mark in marks:
                 writer(mark)
@@ -352,9 +390,10 @@ async def _speak_edge(cast: AsyncIterator[Utterance], writer) -> int:
                 len(utterance.text),
             )
             elapsed = started + await _speak_fallback(
-                utterance.text, utterance, writer, EDGE_SAMPLE_RATE, started
+                utterance.text, utterance, writer, EDGE_SAMPLE_RATE, started, bitrate
             )
 
+        previous_bitrate = bitrate
         spoken += 1
 
     return spoken
